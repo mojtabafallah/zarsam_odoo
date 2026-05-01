@@ -1,0 +1,17 @@
+{
+    "name": "mojtaba/zarsam_odoo",
+    "autoload": {
+        "psr-4": {
+            "Mojtaba\\ZarsamOdoo\\": "src/"
+        }
+    },
+    "authors": [
+        {
+            "name": "mojtaba.fallah",
+            "email": "mojtaba.fallah1373@gmail.com"
+        }
+    ],
+    "require": {
+        "firebase/php-jwt": "^6.10"
+    }
+}
