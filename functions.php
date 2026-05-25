@@ -67,7 +67,7 @@ function getResponse( $data, $message = 'Success', $status = 200, $success = tru
 function permission( \WP_REST_Request $request ): bool
 {
     $token1 = $request->get_header( 'Authorization' );
-    $token1 = self::getBearerToken( $token1 );
+    $token1 = getBearerToken( $token1 );
 
     $k = new Key( 'KkdikUSUiPFDbncIUIUDCDIUVCCudicush123iiu9woih9cachsd8ohc90wqhfo', 'HS256' );
     try {
