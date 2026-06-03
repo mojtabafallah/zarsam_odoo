@@ -62,3 +62,18 @@ function disable_embeds_code_init() {
     remove_action( 'wp_head', 'wp_oembed_add_discovery_links' );
 }
 add_action( 'init', 'disable_embeds_code_init', 9999 );
+
+// ۱. اضافه کردن بازه زمانی ۱۰ دقیقه به لیست زمان‌بندی‌های وردپرس
+add_filter( 'cron_schedules', 'zarsim_add_ten_minutes_cron_schedule' );
+function zarsim_add_ten_minutes_cron_schedule( $schedules ) {
+    $schedules['ten_minutes'] = array(
+        'interval' => 10, // ۱۰ دقیقه به ثانیه
+        'display'  => esc_html__( 'Every 10 Minutes' ),
+    );
+    return $schedules;
+}
+
+// ۲. برنامه‌ریزی برای اجرای خودکار در صورت عدم وجود
+if ( ! wp_next_scheduled( 'zarsim_product_sync_hook' ) ) {
+    wp_schedule_event( time(), 'ten_minutes', 'zarsim_product_sync_hook' );
+}
