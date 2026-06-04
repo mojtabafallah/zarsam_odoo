@@ -21,13 +21,73 @@ class OdooWooSync
         add_action( 'user_register', [ $this, 'create_customer' ] );
         add_action( 'woocommerce_order_status_changed', [ $this, 'create_order' ] );
 
+        add_action( 'post_submitbox_misc_actions', [ $this, 'add_product_api_button' ] );
+        add_action( 'wp_ajax_get_zarsim_rates', [ $this, 'handle_zarsim_rates_request' ] );
+
         // ۳. اتصال اکشن به تابع اصلی همگام‌سازی
 //add_action( 'zarsim_product_sync_hook', 'zarsim_sync_products_from_api' );
         add_action( 'init', [ $this, 'zarsim_sync_products_from_api' ] );
     }
 
+    function handle_zarsim_rates_request() {
+        $product_sku = $_POST['product_id'];
+        $response = $this->call_odoo( 'get_product_list', ['default_code' => $product_sku] );
+        if ( is_wp_error( $response ) ) {
+            return; // در صورت خطا در اتصال، عملیات متوقف شود
+        }
+
+        $products_data = json_decode( wp_remote_retrieve_body( $response ), true );
+        $products_data = $products_data[ 'result' ];
+        $products_data = $products_data[0];
+//        $product_id = wc_get_product_id_by_sku($product_sku);
+//        $product = wc_get_product( $product_id );
+        $final_price = $this->zarsim_process_single_product( $products_data );
+
+        echo 'بروز رسانی قیمت: ' . number_format( $final_price );
+        exit();
+    }
+
+    public function add_product_api_button()
+    {
+        global $post;
+
+        if ( $post->post_type !== 'product' ) {
+            return;
+        }
+        $sku = get_post_meta( $post->ID, '_sku', true );
+
+        ?>
+        <div class="misc-pub-section">
+            <button type="button" class="button button-primary" id="send-api-request">
+                دریافت نرخ
+            </button>
+            <span id="api-result" style="display:block;margin-top:8px;"></span>
+        </div>
+
+        <script>
+            jQuery(document).ready(function ($) {
+
+                $('#send-api-request').on('click', function () {
+
+                    $('#api-result').text('در حال دریافت...');
+
+                    $.post(ajaxurl, {
+                        action: 'get_zarsim_rates',
+                        product_id: <?php echo $sku; ?>
+                    }, function (response) {
+                        $('#api-result').text(response);
+                    });
+
+                });
+
+            });
+        </script>
+        <?php
+    }
+
     public function zarsim_sync_products_from_api()
     {
+
         if ( !isset( $_GET[ 'debug' ] ) ) {
             return;
         }
@@ -42,25 +102,36 @@ class OdooWooSync
         if ( !empty( $products_data ) && is_array( $products_data ) ) {
             foreach ( $products_data as $product_item ) {
                 $this->zarsim_process_single_product( $product_item );
-                exit();
             }
-            exit();
         }
     }
 
-    public function getRates( $url )
+    public function get_zarsim_rates()
     {
-        $json = file_get_contents( $url );
-        if ( $json === false ) {
+        $url = 'https://zarsimjewelry.com/wp-json/zarsim/v1/rates-simple';
+
+        // ارسال درخواست GET
+        $response = wp_remote_get( $url, array (
+            'timeout'   => 15,    // زمان انتظار برای پاسخ
+            'sslverify' => false, // اگر سایت مقصد مشکل SSL داشت این را false بگذارید
+        ) );
+
+        // بررسی وجود خطا در ارتباط
+        if ( is_wp_error( $response ) ) {
             return false;
         }
 
-        $rates = json_decode( $json, true );
-        if ( !is_array( $rates ) ) {
+        // دریافت بدنه پاسخ (Body)
+        $body = wp_remote_retrieve_body( $response );
+
+        // تبدیل فرمت JSON به آرایه یا آبجکت PHP
+        $data = json_decode( $body, true );
+
+        if ( empty( $data ) ) {
             return false;
         }
 
-        return $rates;
+        return $data;
     }
 
     public function calculateProductPrice( array $product, array $rates )
@@ -91,8 +162,7 @@ class OdooWooSync
         // فرض بر این است که $data حاوی SKU یا یک شناسه منحصر به فرد است
         $sku        = $data[ 'default_code' ];
         $product_id = wc_get_product_id_by_sku( $sku );
-        $ratesUrl   = "https://zarsimjewelry.com/wp-json/zarsim/v1/rates-simple";
-        $rates      = $this->getRates( $ratesUrl );
+        $rates      = $this->get_zarsim_rates();
         if ( $product_id ) {
             // به‌روزرسانی محصول موجود
             $product = wc_get_product( $product_id );
@@ -111,9 +181,8 @@ class OdooWooSync
             $new_product->save();
         }
 
-
         update_post_meta( $product_id, 'zarsam_odoo_product_id', $data[ 'id' ] );
-
+        return $result[ 'final_price' ];
     }
 
     public function menu()
