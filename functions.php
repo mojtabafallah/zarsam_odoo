@@ -109,3 +109,13 @@ function getBearerToken( $token )
     }
     return null;
 }
+
+function zarsam_odoo_permission( \WP_REST_Request $request ): bool
+{
+    return permission( $request );
+}
+
+function zarsam_odoo_update_product( \WP_REST_Request $request ): \WP_REST_Response
+{
+    return ( new \Mojtaba\ZarsamOdoo\ApiProducts() )->zarsam_odoo_update_product( $request );
+}

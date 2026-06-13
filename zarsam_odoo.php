@@ -3,16 +3,19 @@
  * Plugin Name: Zarsam Odoo
  * Plugin URI:  https://zarsam.com/
  * Description: این پلاگین اختصاصی برای سایت زرسام توسعه داده شده است و برای ارتباط با odoo میباشد
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      Mojtaba Fallah
  * Author URI:  https://github.com/mojtabafallah/
  */
 
 use Mojtaba\ZarsamOdoo\OdooWooSync;
+use Mojtaba\ZarsamOdoo\SyncLogger;
 
 if ( !defined( 'ABSPATH' ) ) {
     exit;
 }
+
+define( 'ZARSAM_ODOO_VERSION', '1.1.0' );
 
 final class ZarsamOdoo
 {
@@ -22,6 +25,7 @@ final class ZarsamOdoo
     {
         require_once 'vendor/autoload.php';
         require_once 'functions.php';
+        require_once 'routes/products.php';
 
         new OdooWooSync();
 
@@ -37,6 +41,18 @@ final class ZarsamOdoo
 }
 
 ZarsamOdoo::get_instance();
+
+register_activation_hook( __FILE__, function () {
+    SyncLogger::install_table();
+    update_option( 'zarsam_odoo_db_version', ZARSAM_ODOO_VERSION );
+} );
+
+add_action( 'plugins_loaded', function () {
+    if ( get_option( 'zarsam_odoo_db_version' ) !== ZARSAM_ODOO_VERSION ) {
+        SyncLogger::install_table();
+        update_option( 'zarsam_odoo_db_version', ZARSAM_ODOO_VERSION );
+    }
+} );
 
 add_action( 'rest_api_init', function () {
     register_rest_route( "zarsam_odoo/v1", "login", array (
