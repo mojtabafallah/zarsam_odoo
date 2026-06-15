@@ -36,6 +36,7 @@ class OdooWooSync
         add_action( 'woocommerce_payment_complete', [ $this, 'sync_order_customer_wallet_after_payment' ] );
         add_action( 'wp_login', [ $this, 'sync_customer_wallet_after_login' ], 10, 2 );
         add_action( 'woocommerce_before_checkout_form', [ $this, 'sync_current_customer_wallet_on_checkout' ] );
+        add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_login_sync_script' ] );
 
         add_action( 'add_meta_boxes', [ $this, 'register_product_meta_box' ] );
         add_action( 'add_meta_boxes', [ $this, 'register_order_sync_meta_box' ] );
@@ -47,6 +48,9 @@ class OdooWooSync
         add_action( 'wp_ajax_zarsim_sync_customers_batch', [ $this, 'ajax_sync_customers_batch' ] );
         add_action( 'wp_ajax_zarsim_sync_single_customer', [ $this, 'ajax_sync_single_customer' ] );
         add_action( 'wp_ajax_zarsim_sync_single_order', [ $this, 'ajax_sync_single_order' ] );
+        add_action( 'wp_ajax_zarsam_odoo_create_current_customer', [ $this, 'ajax_create_current_customer' ] );
+        add_action( 'wp_ajax_nopriv_zarsam_odoo_create_current_customer', [ $this, 'ajax_create_current_customer' ] );
+        add_action( 'wp_ajax_zarsam_odoo_create_user_customer', [ $this, 'ajax_create_user_customer' ] );
         add_action( 'admin_post_zarsam_odoo_export_logs', [ $this, 'export_logs' ] );
 
         add_filter( 'manage_users_columns', [ $this, 'add_customer_sync_user_column' ] );
@@ -63,6 +67,91 @@ class OdooWooSync
     public static function get_instance(): self
     {
         return self::$instance;
+    }
+
+    public function enqueue_login_sync_script(): void
+    {
+        $script_path = dirname( __DIR__ ) . '/assets/js/odoo-login-sync.js';
+        $script_url  = plugins_url( 'assets/js/odoo-login-sync.js', dirname( __DIR__ ) . '/zarsam_odoo.php' );
+
+        wp_enqueue_script(
+            'zarsam-odoo-login-sync',
+            $script_url,
+            [ 'jquery' ],
+            file_exists( $script_path ) ? (string) filemtime( $script_path ) : ZARSAM_ODOO_VERSION,
+            true
+        );
+
+        wp_localize_script( 'zarsam-odoo-login-sync', 'zarsamOdooLoginSync', [
+            'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+        ] );
+    }
+
+    public function ajax_create_current_customer(): void
+    {
+        if ( ! is_user_logged_in() ) {
+            wp_send_json_error( [ 'message' => 'کاربر هنوز وارد نشده است' ], 401 );
+        }
+
+        $user_id  = get_current_user_id();
+        $lock_key = 'zarsam_odoo_create_customer_after_login_' . $user_id;
+
+        if ( get_transient( $lock_key ) ) {
+            wp_send_json_success( [ 'message' => 'درخواست ساخت مشتری اخیرا ارسال شده است' ] );
+        }
+
+        set_transient( $lock_key, 1, 2 * MINUTE_IN_SECONDS );
+
+        $response = $this->create_customer( $user_id );
+
+        if ( is_wp_error( $response ) ) {
+            delete_transient( $lock_key );
+            wp_send_json_error( [ 'message' => $response->get_error_message() ], 500 );
+        }
+
+        wp_send_json_success( [ 'message' => 'درخواست ساخت مشتری به Odoo ارسال شد' ] );
+    }
+
+    public function ajax_create_user_customer(): void
+    {
+        check_ajax_referer( 'zarsam_odoo_create_user_customer', 'nonce' );
+
+        $user_id = isset( $_POST[ 'user_id' ] ) ? (int) $_POST[ 'user_id' ] : 0;
+
+        if ( !$user_id || !current_user_can( 'edit_user', $user_id ) ) {
+            wp_send_json_error( [ 'message' => 'دسترسی ندارید' ] );
+        }
+
+        $response = $this->create_customer( $user_id );
+        $success  = !is_wp_error( $response );
+        $body     = $success ? json_decode( wp_remote_retrieve_body( $response ), true ) : [];
+
+        if ( $success && !empty( $body[ 'error' ] ) ) {
+            $success = false;
+        }
+
+        SyncLogger::log( [
+            'sync_type'     => 'customer_create_manual',
+            'product_id'    => $user_id,
+            'action'        => 'create_customer',
+            'request_data'  => [
+                'user_id' => $user_id,
+                'mobile'  => $this->get_customer_mobile_for_user( $user_id ),
+            ],
+            'response_data' => is_wp_error( $response ) ? [ 'error' => $response->get_error_message() ] : $body,
+            'has_changes'   => 0,
+            'message'       => $success ? 'درخواست ایجاد مشتری در Odoo ارسال شد' : 'خطا در ایجاد مشتری در Odoo',
+        ] );
+
+        if ( !$success ) {
+            wp_send_json_error( [
+                'message' => is_wp_error( $response )
+                    ? $response->get_error_message()
+                    : 'Odoo خطا برگرداند. جزئیات در لاگ ثبت شد.',
+            ] );
+        }
+
+        wp_send_json_success( [ 'message' => 'درخواست ایجاد کاربر در Odoo ارسال شد' ] );
     }
 
     private function assign_product_category( int $product_id, array $data ): void
@@ -1168,7 +1257,7 @@ class OdooWooSync
             return [ 'updated' => false, 'message' => 'موجودی کیف پول در پاسخ Odoo وجود ندارد' ];
         }
 
-        $target_balance = (float) $data[ 'customer_wallet' ];
+        $target_balance = (float) $data[ 'customer_wallet' ] / 10;
         $old_balance    = (float) get_user_meta( $user_id, '_woo_wallet_balance', true );
         $method         = 'user_meta';
         $description    = sprintf(
@@ -1334,6 +1423,11 @@ class OdooWooSync
             <?php disabled( !$odoo_id ); ?>>
             سینک Odoo
         </button>
+        <button type="button"
+                class="button button-small zarsam-create-customer-odoo"
+                data-user-id="<?php echo (int) $user_id; ?>">
+            ایجاد کاربر در Odoo
+        </button>
         <span class="zarsam-sync-customer-status" style="display:block;margin-top:4px;">
             <?php echo $last ? esc_html( $last ) : ( $odoo_id ? '' : 'بدون Odoo ID' ); ?>
         </span>
@@ -1374,6 +1468,11 @@ class OdooWooSync
                             data-user-id="<?php echo (int) $user->ID; ?>"
                             data-odoo-id="<?php echo esc_attr( $odoo_id ); ?>">
                         همگام‌سازی این مشتری از Odoo
+                    </button>
+                    <button type="button"
+                            class="button zarsam-create-customer-odoo"
+                            data-user-id="<?php echo (int) $user->ID; ?>">
+                        ایجاد کاربر در Odoo
                     </button>
                     <span class="zarsam-sync-customer-status" style="margin-right:8px;"></span>
                 </td>
@@ -1429,6 +1528,30 @@ class OdooWooSync
                             $status.css('color', '#b32d2e').text(response.data.message || 'خطا در همگام‌سازی');
                             $button.prop('disabled', false);
                         }
+                    }).fail(function () {
+                        $status.css('color', '#b32d2e').text('خطا در ارتباط با سرور');
+                        $button.prop('disabled', false);
+                    });
+                });
+
+                $(document).on('click', '.zarsam-create-customer-odoo', function () {
+                    var $button = $(this);
+                    var $status = $button.siblings('.zarsam-sync-customer-status');
+
+                    $button.prop('disabled', true);
+                    $status.css('color', '#2271b1').text('در حال ایجاد کاربر در Odoo...');
+
+                    $.post(ajaxurl, {
+                        action: 'zarsam_odoo_create_user_customer',
+                        nonce: '<?php echo esc_js( wp_create_nonce( 'zarsam_odoo_create_user_customer' ) ); ?>',
+                        user_id: $button.data('user-id')
+                    }).done(function (response) {
+                        if (response.success) {
+                            $status.css('color', '#008a20').text(response.data.message);
+                        } else {
+                            $status.css('color', '#b32d2e').text(response.data.message || 'خطا در ایجاد کاربر در Odoo');
+                        }
+                        $button.prop('disabled', false);
                     }).fail(function () {
                         $status.css('color', '#b32d2e').text('خطا در ارتباط با سرور');
                         $button.prop('disabled', false);
@@ -1525,6 +1648,9 @@ class OdooWooSync
                     </option>
                     <option value="customer_single_sync" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_single_sync' ); ?>>
                         مشتری تکی
+                    </option>
+                    <option value="customer_create_manual" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_create_manual' ); ?>>
+                        ایجاد دستی مشتری در Odoo
                     </option>
                     <option value="customer_wallet_login" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_wallet_login' ); ?>>
                         کیف پول بعد از ورود
@@ -2216,22 +2342,25 @@ class OdooWooSync
 
     public function create_customer( $user_id )
     {
-        if ( $this->is_importing_odoo_customer ) {
-            return;
-        }
+//        if ( $this->is_importing_odoo_customer ) {
+//            return;
+//        }
 
         $user = get_userdata( $user_id );
+        if ( !$user ) {
+            return null;
+        }
 
         $data = [
             "customer_id"                => $user_id,
             "customer_name"              => $user->display_name,
-            "customer_mobile"            => get_user_meta( $user_id, 'billing_phone', true ),
+            "customer_mobile"            => $this->get_customer_mobile_for_user( (int) $user_id ),
             "customer_birthdate"         => "",
             "customer_partner_birthdate" => "",
             "customer_wedding_date"      => ""
         ];
 
-        $this->call_odoo( "create_customer", $data );
+        return $this->call_odoo( "create_customer", $data );
     }
 
     public function create_order( $order_id )
