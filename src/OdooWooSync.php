@@ -22,6 +22,7 @@ class OdooWooSync
     const USER_META_RAW_DATA  = 'zarsam_odoo_customer_raw_data';
     const USER_META_LAST_SYNC = 'zarsam_odoo_customer_last_sync';
     const USER_META_FROM_ODOO = 'zarsam_odoo_created_from_odoo';
+    const USER_META_CREATE_SENT = 'zarsam_odoo_customer_create_sent';
 
     private static $instance                   = null;
     private        $is_importing_odoo_customer = false;
@@ -37,6 +38,7 @@ class OdooWooSync
         add_action( 'wp_login', [ $this, 'sync_customer_wallet_after_login' ], 10, 2 );
         add_action( 'woocommerce_before_checkout_form', [ $this, 'sync_current_customer_wallet_on_checkout' ] );
         add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_login_sync_script' ] );
+        add_action( 'template_redirect', [ $this, 'maybe_create_current_customer_after_login' ], 20 );
 
         add_action( 'add_meta_boxes', [ $this, 'register_product_meta_box' ] );
         add_action( 'add_meta_boxes', [ $this, 'register_order_sync_meta_box' ] );
@@ -112,6 +114,65 @@ class OdooWooSync
         wp_send_json_success( [ 'message' => 'درخواست ساخت مشتری به Odoo ارسال شد' ] );
     }
 
+    public function maybe_create_current_customer_after_login(): void
+    {
+        if ( is_admin() || wp_doing_ajax() || wp_doing_cron() || !is_user_logged_in() ) {
+            return;
+        }
+
+        $user_id = get_current_user_id();
+        $user    = get_userdata( $user_id );
+
+        if ( !$user || in_array( 'administrator', (array) $user->roles, true ) ) {
+            return;
+        }
+
+        if (
+            get_user_meta( $user_id, self::USER_META_ODOO_ID, true )
+            || get_user_meta( $user_id, self::USER_META_CREATE_SENT, true )
+        ) {
+            return;
+        }
+
+        if ( $this->get_customer_mobile_for_user( $user_id ) === '' ) {
+            return;
+        }
+
+        $lock_key = 'zarsam_odoo_auto_create_customer_' . $user_id;
+        if ( get_transient( $lock_key ) ) {
+            return;
+        }
+
+        set_transient( $lock_key, 1, 10 * MINUTE_IN_SECONDS );
+
+        $response = $this->create_customer( $user_id );
+        $success  = !is_wp_error( $response );
+        $body     = $success ? json_decode( wp_remote_retrieve_body( $response ), true ) : [];
+
+        if ( $success && !empty( $body[ 'error' ] ) ) {
+            $success = false;
+        }
+
+        if ( $success ) {
+            update_user_meta( $user_id, self::USER_META_CREATE_SENT, current_time( 'mysql' ) );
+        }
+
+        SyncLogger::log( [
+            'sync_type'     => 'customer_create_after_login',
+            'product_id'    => $user_id,
+            'action'        => 'create_customer',
+            'request_data'  => [
+                'user_id' => $user_id,
+                'mobile'  => $this->sanitize_and_format_ir_mobile ($this->get_customer_mobile_for_user( $user_id )),
+            ],
+            'response_data' => is_wp_error( $response ) ? [ 'error' => $response->get_error_message() ] : $body,
+            'has_changes'   => 0,
+            'message'       => $success
+                ? 'ایجاد مشتری در Odoo بعد از تشخیص لاگین ارسال شد'
+                : 'خطا در ایجاد مشتری در Odoo بعد از تشخیص لاگین',
+        ] );
+    }
+
     public function ajax_create_user_customer(): void
     {
         check_ajax_referer( 'zarsam_odoo_create_user_customer', 'nonce' );
@@ -120,6 +181,10 @@ class OdooWooSync
 
         if ( !$user_id || !current_user_can( 'edit_user', $user_id ) ) {
             wp_send_json_error( [ 'message' => 'دسترسی ندارید' ] );
+        }
+
+        if ( get_user_meta( $user_id, self::USER_META_ODOO_ID, true ) ) {
+            wp_send_json_error( [ 'message' => 'این کاربر قبلا Odoo ID دارد و نیازی به ایجاد دوباره نیست.' ] );
         }
 
         $response = $this->create_customer( $user_id );
@@ -136,7 +201,7 @@ class OdooWooSync
             'action'        => 'create_customer',
             'request_data'  => [
                 'user_id' => $user_id,
-                'mobile'  => $this->get_customer_mobile_for_user( $user_id ),
+                'mobile'  => $this->sanitize_and_format_ir_mobile( $this->get_customer_mobile_for_user( $user_id )),
             ],
             'response_data' => is_wp_error( $response ) ? [ 'error' => $response->get_error_message() ] : $body,
             'has_changes'   => 0,
@@ -1069,7 +1134,7 @@ class OdooWooSync
             return is_array( $body[ 'result' ][ 0 ] ?? null ) ? $body[ 'result' ][ 0 ] : [];
         }
 
-        $mobile = $this->get_customer_mobile_for_user( $user_id );
+        $mobile = $this->sanitize_and_format_ir_mobile( $this->get_customer_mobile_for_user( $user_id ));
         if ( $mobile === '' ) {
             SyncLogger::log( [
                 'sync_type'   => $sync_type,
@@ -1423,11 +1488,13 @@ class OdooWooSync
             <?php disabled( !$odoo_id ); ?>>
             سینک Odoo
         </button>
+        <?php if ( !$odoo_id ) : ?>
         <button type="button"
                 class="button button-small zarsam-create-customer-odoo"
                 data-user-id="<?php echo (int) $user_id; ?>">
             ایجاد کاربر در Odoo
         </button>
+    <?php endif; ?>
         <span class="zarsam-sync-customer-status" style="display:block;margin-top:4px;">
             <?php echo $last ? esc_html( $last ) : ( $odoo_id ? '' : 'بدون Odoo ID' ); ?>
         </span>
@@ -1469,11 +1536,13 @@ class OdooWooSync
                             data-odoo-id="<?php echo esc_attr( $odoo_id ); ?>">
                         همگام‌سازی این مشتری از Odoo
                     </button>
-                    <button type="button"
-                            class="button zarsam-create-customer-odoo"
-                            data-user-id="<?php echo (int) $user->ID; ?>">
-                        ایجاد کاربر در Odoo
-                    </button>
+                    <?php if ( !$odoo_id ) : ?>
+                        <button type="button"
+                                class="button zarsam-create-customer-odoo"
+                                data-user-id="<?php echo (int) $user->ID; ?>">
+                            ایجاد کاربر در Odoo
+                        </button>
+                    <?php endif; ?>
                     <span class="zarsam-sync-customer-status" style="margin-right:8px;"></span>
                 </td>
             </tr>
@@ -1651,6 +1720,9 @@ class OdooWooSync
                     </option>
                     <option value="customer_create_manual" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_create_manual' ); ?>>
                         ایجاد دستی مشتری در Odoo
+                    </option>
+                    <option value="customer_create_after_login" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_create_after_login' ); ?>>
+                        ایجاد مشتری بعد از لاگین
                     </option>
                     <option value="customer_wallet_login" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_wallet_login' ); ?>>
                         کیف پول بعد از ورود
@@ -2354,13 +2426,21 @@ class OdooWooSync
         $data = [
             "customer_id"                => $user_id,
             "customer_name"              => $user->display_name,
-            "customer_mobile"            => $this->get_customer_mobile_for_user( (int) $user_id ),
-            "customer_birthdate"         => "",
-            "customer_partner_birthdate" => "",
-            "customer_wedding_date"      => ""
+            "customer_mobile"            => $this->sanitize_and_format_ir_mobile($this->get_customer_mobile_for_user( (int) $user_id )),
+            "customer_birthdate"         => false,
+            "customer_partner_birthdate" => false,
+            "customer_wedding_date"      => false
         ];
 
-        return $this->call_odoo( "create_customer", $data );
+        $response = $this->call_odoo( "create_customer", $data );
+        $success  = !is_wp_error( $response );
+        $body     = $success ? json_decode( wp_remote_retrieve_body( $response ), true ) : [];
+
+        if ( $success && empty( $body[ 'error' ] ) ) {
+            update_user_meta( (int) $user_id, self::USER_META_CREATE_SENT, current_time( 'mysql' ) );
+        }
+
+        return $response;
     }
 
     public function create_order( $order_id )
