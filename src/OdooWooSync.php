@@ -37,6 +37,7 @@ class OdooWooSync
         add_action( 'woocommerce_payment_complete', [ $this, 'sync_order_customer_wallet_after_payment' ] );
         add_action( 'wp_login', [ $this, 'sync_customer_wallet_after_login' ], 10, 2 );
         add_action( 'woocommerce_before_checkout_form', [ $this, 'sync_current_customer_wallet_on_checkout' ] );
+        add_action( 'woocommerce_after_checkout_validation', [ $this, 'validate_cart_with_odoo_before_checkout' ], 10, 2 );
         add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_login_sync_script' ] );
         add_action( 'template_redirect', [ $this, 'maybe_create_current_customer_after_login' ], 20 );
 
@@ -1074,6 +1075,102 @@ class OdooWooSync
         }
 
         $this->sync_customer_wallet_from_odoo_user( get_current_user_id(), 'customer_wallet_checkout' );
+    }
+
+    public function validate_cart_with_odoo_before_checkout( array $data, \WP_Error $errors ): void
+    {
+        if ( !function_exists( 'WC' ) || !WC()->cart || WC()->cart->is_empty() ) {
+            return;
+        }
+
+        $rates = $this->get_zarsim_rates( 'checkout_validation' );
+        if ( $rates === false ) {
+            $errors->add(
+                'zarsam_rates_unavailable',
+                'در حال حاضر امکان بررسی قیمت لحظه‌ای وجود ندارد. لطفا چند دقیقه دیگر دوباره تلاش کنید.'
+            );
+            return;
+        }
+
+        foreach ( WC()->cart->get_cart() as $cart_item ) {
+            $product = $cart_item[ 'data' ] ?? null;
+            if ( !$product || !method_exists( $product, 'get_sku' ) ) {
+                continue;
+            }
+
+            $sku        = (string) $product->get_sku();
+            $product_id = (int) $product->get_id();
+
+            if ( $sku === '' ) {
+                $errors->add(
+                    'zarsam_odoo_missing_sku',
+                    sprintf( 'محصول «%s» شناسه SKU ندارد و امکان بررسی با Odoo وجود ندارد.', $product->get_name() )
+                );
+                continue;
+            }
+
+            $request_payload = [ 'default_code' => $sku ];
+            $response        = $this->call_odoo( 'get_product_list', $request_payload );
+
+            if ( is_wp_error( $response ) ) {
+                SyncLogger::log( [
+                    'sync_type'     => 'checkout_validation',
+                    'product_id'    => $product_id,
+                    'sku'           => $sku,
+                    'action'        => 'get_product_list',
+                    'request_data'  => $request_payload,
+                    'response_data' => [ 'error' => $response->get_error_message() ],
+                    'has_changes'   => 0,
+                    'message'       => 'خطا در اتصال به Odoo هنگام پرداخت',
+                ] );
+
+                $errors->add(
+                    'zarsam_odoo_unavailable',
+                    'در حال حاضر ارتباط با Odoo برقرار نیست و سفارش ثبت نمی‌شود. لطفا چند دقیقه دیگر دوباره تلاش کنید.'
+                );
+                continue;
+            }
+
+            $status_code = (int) wp_remote_retrieve_response_code( $response );
+            $body        = json_decode( wp_remote_retrieve_body( $response ), true );
+            $odoo_data   = $body[ 'result' ][ 0 ] ?? null;
+
+            if ( $status_code < 200 || $status_code >= 300 || !empty( $body[ 'error' ] ) || empty( $odoo_data ) || !is_array( $odoo_data ) ) {
+                SyncLogger::log( [
+                    'sync_type'     => 'checkout_validation',
+                    'product_id'    => $product_id,
+                    'sku'           => $sku,
+                    'action'        => 'get_product_list',
+                    'request_data'  => $request_payload,
+                    'response_data' => $body ?: wp_remote_retrieve_body( $response ),
+                    'has_changes'   => 0,
+                    'message'       => 'پاسخ نامعتبر از Odoo هنگام پرداخت',
+                ] );
+
+                $errors->add(
+                    'zarsam_odoo_invalid_response',
+                    sprintf( 'امکان بررسی لحظه‌ای محصول «%s» در Odoo وجود ندارد و سفارش ثبت نمی‌شود.', $product->get_name() )
+                );
+                continue;
+            }
+
+            $calculation   = $this->calculateProductPrice( $odoo_data, $rates );
+            $live_price    = (float) ( $calculation[ 'final_price' ] ?? 0 );
+            $woo_price     = (float) $product->get_price();
+            $live_stock    = (int) ( $odoo_data[ 'qty_available' ] ?? 0 );
+            $cart_qty      = (int) ( $cart_item[ 'quantity' ] ?? 0 );
+            $price_changed = abs( $live_price - $woo_price ) > 0.01;
+            $stock_changed = $live_stock < $cart_qty || $live_stock !== (int) $product->get_stock_quantity();
+
+            if ( $price_changed || $stock_changed ) {
+                $this->zarsim_process_single_product( $odoo_data, $rates, 'checkout_validation', $product_id );
+
+                $errors->add(
+                    'zarsam_odoo_product_changed',
+                    sprintf( 'قیمت یا موجودی محصول «%s» تغییر کرده است. محصول به‌روزرسانی شد؛ لطفا سبد خرید را دوباره بررسی کنید.', $product->get_name() )
+                );
+            }
+        }
     }
 
     public function sync_order_customer_wallet_after_payment( int $order_id ): void
