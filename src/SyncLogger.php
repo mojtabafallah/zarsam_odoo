@@ -8,6 +8,9 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 class SyncLogger
 {
+    private const ADMIN_NOTIFICATIONS_OPTION = 'zarsam_odoo_admin_notifications';
+    private const MAX_ADMIN_NOTIFICATIONS      = 50;
+
     public static function table_name(): string
     {
         global $wpdb;
@@ -64,6 +67,10 @@ class SyncLogger
         ];
 
         $data = wp_parse_args( $args, $defaults );
+
+        if ( self::should_notify_error( $data ) ) {
+            self::notify_error( $data );
+        }
 
         $wpdb->insert(
             self::table_name(),
@@ -187,6 +194,205 @@ class SyncLogger
 
         fclose( $output );
         exit;
+    }
+
+    public static function get_notification_emails(): array
+    {
+        $raw = (string) get_option( 'odoo_error_notification_emails', '' );
+        if ( $raw === '' ) {
+            return [];
+        }
+
+        $parts  = preg_split( '/[\s,;]+/', $raw, -1, PREG_SPLIT_NO_EMPTY );
+        $emails = [];
+
+        foreach ( $parts as $part ) {
+            $email = sanitize_email( trim( $part ) );
+            if ( is_email( $email ) ) {
+                $emails[] = $email;
+            }
+        }
+
+        return array_values( array_unique( $emails ) );
+    }
+
+    public static function notify_error( array $args ): void
+    {
+        self::notify_error_emails( $args );
+        self::add_admin_notification( $args );
+    }
+
+    public static function notify_error_emails( array $args ): void
+    {
+        $emails = self::get_notification_emails();
+        if ( empty( $emails ) ) {
+            return;
+        }
+
+        $dedup_key = 'zarsam_odoo_err_mail_' . self::build_error_dedup_key( $args );
+        if ( get_transient( $dedup_key ) ) {
+            return;
+        }
+
+        set_transient( $dedup_key, 1, 2 * MINUTE_IN_SECONDS );
+
+        $site_name = wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES );
+        $action    = sanitize_text_field( (string) ( $args['action'] ?? 'درخواست' ) );
+        $subject   = sprintf( '[%s] خطای Odoo: %s', $site_name, $action );
+
+        wp_mail(
+            $emails,
+            $subject,
+            self::build_error_email_body( $args ),
+            [ 'Content-Type: text/plain; charset=UTF-8' ]
+        );
+    }
+
+    public static function add_admin_notification( array $args ): void
+    {
+        $dedup_key = 'zarsam_odoo_err_admin_' . self::build_error_dedup_key( $args );
+        if ( get_transient( $dedup_key ) ) {
+            return;
+        }
+
+        set_transient( $dedup_key, 1, 2 * MINUTE_IN_SECONDS );
+
+        $notifications = get_option( self::ADMIN_NOTIFICATIONS_OPTION, [] );
+        if ( ! is_array( $notifications ) ) {
+            $notifications = [];
+        }
+
+        array_unshift( $notifications, [
+            'id'        => uniqid( 'odoo_', true ),
+            'time'      => current_time( 'mysql' ),
+            'sync_type' => sanitize_text_field( (string) ( $args['sync_type'] ?? '' ) ),
+            'action'    => sanitize_text_field( (string) ( $args['action'] ?? '' ) ),
+            'sku'       => sanitize_text_field( (string) ( $args['sku'] ?? '' ) ),
+            'message'   => sanitize_text_field( (string) ( $args['message'] ?? '' ) ),
+            'read'      => false,
+        ] );
+
+        $notifications = array_slice( $notifications, 0, self::MAX_ADMIN_NOTIFICATIONS );
+        update_option( self::ADMIN_NOTIFICATIONS_OPTION, $notifications, false );
+    }
+
+    public static function get_admin_notifications( int $limit = 20 ): array
+    {
+        $notifications = get_option( self::ADMIN_NOTIFICATIONS_OPTION, [] );
+        if ( ! is_array( $notifications ) ) {
+            return [];
+        }
+
+        return array_slice( $notifications, 0, $limit );
+    }
+
+    public static function get_unread_notification_count(): int
+    {
+        $notifications = get_option( self::ADMIN_NOTIFICATIONS_OPTION, [] );
+        if ( ! is_array( $notifications ) ) {
+            return 0;
+        }
+
+        $count = 0;
+        foreach ( $notifications as $notification ) {
+            if ( empty( $notification['read'] ) ) {
+                $count++;
+            }
+        }
+
+        return $count;
+    }
+
+    public static function mark_all_notifications_read(): void
+    {
+        $notifications = get_option( self::ADMIN_NOTIFICATIONS_OPTION, [] );
+        if ( ! is_array( $notifications ) ) {
+            return;
+        }
+
+        foreach ( $notifications as &$notification ) {
+            $notification['read'] = true;
+        }
+        unset( $notification );
+
+        update_option( self::ADMIN_NOTIFICATIONS_OPTION, $notifications, false );
+    }
+
+    private static function should_notify_error( array $data ): bool
+    {
+        if ( ! empty( $data['suppress_notify'] ) ) {
+            return false;
+        }
+
+        if ( ! empty( $data['is_error'] ) ) {
+            return true;
+        }
+
+        $message = (string) ( $data['message'] ?? '' );
+        if ( $message !== '' && preg_match( '/خطا|ناموفق|نامعتبر|rate_fetch_failed/u', $message ) ) {
+            return true;
+        }
+
+        return self::response_contains_error( $data['response_data'] ?? null );
+    }
+
+    private static function response_contains_error( $response_data ): bool
+    {
+        if ( is_array( $response_data ) ) {
+            return ! empty( $response_data['error'] );
+        }
+
+        if ( is_string( $response_data ) && $response_data !== '' ) {
+            $decoded = json_decode( $response_data, true );
+            return is_array( $decoded ) && ! empty( $decoded['error'] );
+        }
+
+        return false;
+    }
+
+    private static function build_error_dedup_key( array $args ): string
+    {
+        $signature = [
+            'sync_type'     => $args['sync_type'] ?? '',
+            'action'        => $args['action'] ?? '',
+            'sku'           => $args['sku'] ?? '',
+            'message'       => $args['message'] ?? '',
+            'response_data' => $args['response_data'] ?? null,
+        ];
+
+        return md5( wp_json_encode( $signature, JSON_UNESCAPED_UNICODE ) );
+    }
+
+    private static function build_error_email_body( array $args ): string
+    {
+        $lines = [
+            'یک خطا در درخواست Odoo/Zarsam رخ داده است.',
+            '',
+            'زمان: ' . current_time( 'mysql' ),
+            'سایت: ' . home_url(),
+            'نوع: ' . ( $args['sync_type'] ?? '-' ),
+            'عملیات: ' . ( $args['action'] ?? '-' ),
+            'SKU / شناسه: ' . ( $args['sku'] ?? '-' ),
+            'پیام: ' . ( $args['message'] ?? '-' ),
+        ];
+
+        if ( ! empty( $args['product_id'] ) ) {
+            $lines[] = 'شناسه محصول/کاربر: ' . (int) $args['product_id'];
+        }
+
+        if ( ! empty( $args['request_data'] ) ) {
+            $lines[] = '';
+            $lines[] = 'درخواست:';
+            $lines[] = self::encode( $args['request_data'] );
+        }
+
+        if ( ! empty( $args['response_data'] ) ) {
+            $lines[] = '';
+            $lines[] = 'پاسخ:';
+            $lines[] = self::encode( $args['response_data'] );
+        }
+
+        return implode( "\n", $lines );
     }
 
     private static function encode( $data ): ?string
