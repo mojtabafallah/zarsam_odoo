@@ -3,19 +3,32 @@ jQuery(function ($) {
         return;
     }
 
+    var defaultErrorMessage = 'امکان افزودن این محصول به سبد خرید وجود ندارد.';
+
+    function isAddToCartRequest(url) {
+        if (!url) {
+            return false;
+        }
+
+        return url.indexOf('add_to_cart') !== -1 || url.indexOf('wc-ajax=add_to_cart') !== -1;
+    }
+
     function escapeHtml(text) {
         return $('<div>').text(text).html();
     }
 
+    function resetAddToCartButtons() {
+        $('.add_to_cart_button.loading, .single_add_to_cart_button.loading, button.loading.add_to_cart_button')
+            .removeClass('loading');
+    }
+
     function showCartError(message) {
-        if (!message) {
-            return;
-        }
+        var finalMessage = message || defaultErrorMessage;
 
         var noticeHtml =
             '<div class="woocommerce-notices-wrapper zarsam-odoo-cart-notice">' +
             '<ul class="woocommerce-error" role="alert">' +
-            '<li>' + escapeHtml(message) + '</li>' +
+            '<li>' + escapeHtml(finalMessage) + '</li>' +
             '</ul>' +
             '</div>';
 
@@ -42,8 +55,13 @@ jQuery(function ($) {
         }
     }
 
-    $.ajaxPrefilter(function (options, originalOptions, jqXHR) {
-        if (!options.url || options.url.indexOf('add_to_cart') === -1) {
+    function handleAddToCartError(response) {
+        resetAddToCartButtons();
+        showCartError(response && response.error_message ? response.error_message : defaultErrorMessage);
+    }
+
+    $.ajaxPrefilter(function (options) {
+        if (!isAddToCartRequest(options.url)) {
             return;
         }
 
@@ -51,24 +69,24 @@ jQuery(function ($) {
 
         options.success = function (response) {
             if (response && response.error) {
-                if (response.error_message) {
-                    showCartError(response.error_message);
-                }
-
-                $('.add_to_cart_button.loading, .single_add_to_cart_button.loading').removeClass('loading');
-
-                if (response.product_url) {
-                    if (typeof originalSuccess === 'function') {
-                        originalSuccess.apply(this, arguments);
-                    }
-                    return;
-                }
-
+                handleAddToCartError(response);
                 return;
             }
 
             if (typeof originalSuccess === 'function') {
                 originalSuccess.apply(this, arguments);
+            }
+        };
+
+        var originalComplete = options.complete;
+
+        options.complete = function (xhr, status) {
+            if (status !== 'success') {
+                resetAddToCartButtons();
+            }
+
+            if (typeof originalComplete === 'function') {
+                originalComplete.apply(this, arguments);
             }
         };
     });

@@ -93,6 +93,22 @@ class SyncLogger
         return (int) $wpdb->insert_id;
     }
 
+    public static function count_logs(): int
+    {
+        global $wpdb;
+
+        return (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . self::table_name() );
+    }
+
+    public static function delete_all_logs(): bool
+    {
+        global $wpdb;
+
+        $result = $wpdb->query( 'TRUNCATE TABLE ' . self::table_name() );
+
+        return $result !== false;
+    }
+
     public static function get_logs( int $page = 1, int $per_page = 20, array $filters = [] ): array
     {
         global $wpdb;

@@ -24,16 +24,19 @@ class OdooWooSync
     const USER_META_FROM_ODOO = 'zarsam_odoo_created_from_odoo';
     const USER_META_CREATE_SENT = 'zarsam_odoo_customer_create_sent';
 
-    private static $instance                   = null;
-    private static $add_to_cart_error_message = '';
-    private        $is_importing_odoo_customer = false;
+    private static $instance                        = null;
+    private static $add_to_cart_error_message       = '';
+    private static $product_stock_validation_cache  = [];
+    private        $is_importing_odoo_customer      = false;
 
     public function __construct()
     {
         self::$instance = $this;
         $this->api_key  = get_option( 'odoo_token' );
         add_action( 'admin_menu', [ $this, 'menu' ] );
-        add_action( 'user_register', [ $this, 'create_customer' ] );
+        add_action( 'user_register', [ $this, 'create_customer_on_register' ], 20, 1 );
+        add_action( 'edit_user_created_user', [ $this, 'create_customer_on_register' ], 20, 1 );
+        add_action( 'woocommerce_created_customer', [ $this, 'create_customer_on_register' ], 20, 1 );
         add_action( 'woocommerce_init', [ $this, 'register_order_sync_status_hooks' ] );
         add_action( 'woocommerce_payment_complete', [ $this, 'sync_order_customer_wallet_after_payment' ] );
         add_action( 'wp_login', [ $this, 'sync_customer_wallet_after_login' ], 10, 2 );
@@ -41,6 +44,7 @@ class OdooWooSync
         add_action( 'woocommerce_after_checkout_validation', [ $this, 'validate_cart_with_odoo_before_checkout' ], 10, 2 );
         add_filter( 'woocommerce_add_to_cart_validation', [ $this, 'validate_add_to_cart_with_odoo' ], 10, 5 );
         add_filter( 'woocommerce_update_cart_validation', [ $this, 'validate_update_cart_with_odoo' ], 10, 4 );
+        add_filter( 'woocommerce_add_to_cart_redirect', [ $this, 'maybe_block_add_to_cart_redirect' ], 10, 2 );
         add_action( 'woocommerce_init', [ $this, 'register_custom_add_to_cart_ajax' ] );
         add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_add_to_cart_error_script' ] );
         add_action( 'zarsam_odoo_report_issue', [ $this, 'report_issue_to_odoo' ] );
@@ -62,6 +66,7 @@ class OdooWooSync
         add_action( 'wp_ajax_nopriv_zarsam_odoo_create_current_customer', [ $this, 'ajax_create_current_customer' ] );
         add_action( 'wp_ajax_zarsam_odoo_create_user_customer', [ $this, 'ajax_create_user_customer' ] );
         add_action( 'admin_post_zarsam_odoo_export_logs', [ $this, 'export_logs' ] );
+        add_action( 'admin_post_zarsam_odoo_delete_all_logs', [ $this, 'delete_all_logs' ] );
         add_action( 'admin_post_zarsam_odoo_mark_notifications_read', [ $this, 'mark_notifications_read' ] );
         add_action( 'admin_notices', [ $this, 'render_admin_error_notices' ] );
 
@@ -185,13 +190,14 @@ class OdooWooSync
             return;
         }
 
-        $product_id        = apply_filters( 'woocommerce_add_to_cart_product_id', absint( $_POST['product_id'] ) );
-        $product           = wc_get_product( $product_id );
-        $quantity          = empty( $_POST['quantity'] ) ? 1 : wc_stock_amount( wp_unslash( $_POST['quantity'] ) );
-        $passed_validation = apply_filters( 'woocommerce_add_to_cart_validation', true, $product_id, $quantity );
-        $product_status    = get_post_status( $product_id );
-        $variation_id      = 0;
-        $variation         = [];
+        self::$add_to_cart_error_message = '';
+
+        $product_id     = apply_filters( 'woocommerce_add_to_cart_product_id', absint( $_POST['product_id'] ) );
+        $product        = wc_get_product( $product_id );
+        $quantity       = empty( $_POST['quantity'] ) ? 1 : wc_stock_amount( wp_unslash( $_POST['quantity'] ) );
+        $product_status = get_post_status( $product_id );
+        $variation_id   = 0;
+        $variation      = [];
 
         if ( $product && $product->is_type( 'variation' ) ) {
             $variation_id = $product_id;
@@ -199,7 +205,9 @@ class OdooWooSync
             $variation    = $product->get_variation_attributes();
         }
 
-        if ( $passed_validation && false !== WC()->cart->add_to_cart( $product_id, $quantity, $variation_id, $variation ) && 'publish' === $product_status ) {
+        $added = WC()->cart->add_to_cart( $product_id, $quantity, $variation_id, $variation );
+
+        if ( false !== $added && 'publish' === $product_status ) {
             do_action( 'woocommerce_ajax_added_to_cart', $product_id );
 
             if ( 'yes' === get_option( 'woocommerce_cart_redirect_after_add' ) ) {
@@ -207,31 +215,87 @@ class OdooWooSync
             }
 
             \WC_AJAX::get_refreshed_fragments();
-        } else {
-            $error_message = self::$add_to_cart_error_message;
-
-            if ( $error_message === '' ) {
-                $notices = wc_get_notices( 'error' );
-                if ( !empty( $notices ) ) {
-                    $messages      = wp_list_pluck( $notices, 'notice' );
-                    $error_message = implode( ' ', array_map( 'wp_strip_all_tags', $messages ) );
-                }
-            }
-
-            self::$add_to_cart_error_message = '';
-
-            $data = [
-                'error'         => true,
-                'product_url'   => apply_filters( 'woocommerce_cart_redirect_after_error', get_permalink( $product_id ), $product_id ),
-                'error_message' => $error_message,
-            ];
-
-            if ( $error_message !== '' ) {
-                $data['product_url'] = false;
-            }
-
-            wp_send_json( $data );
         }
+
+        wc_clear_notices( 'success' );
+
+        $error_message = self::$add_to_cart_error_message;
+
+        if ( $error_message === '' ) {
+            $notices = wc_get_notices( 'error' );
+            if ( !empty( $notices ) ) {
+                $messages      = wp_list_pluck( $notices, 'notice' );
+                $error_message = implode( ' ', array_map( 'wp_strip_all_tags', $messages ) );
+            }
+        }
+
+        if ( $error_message === '' ) {
+            $error_message = 'امکان افزودن این محصول به سبد خرید وجود ندارد.';
+        }
+
+        self::$add_to_cart_error_message = '';
+
+        wp_send_json( [
+            'error'         => true,
+            'product_url'   => false,
+            'error_message' => $error_message,
+        ] );
+    }
+
+    public function maybe_block_add_to_cart_redirect( $url, $product_id )
+    {
+        if ( self::$add_to_cart_error_message !== '' || wc_notice_count( 'error' ) > 0 ) {
+            return false;
+        }
+
+        return $url;
+    }
+
+    public function create_customer_on_register( $user_id ): void
+    {
+        $user_id = (int) $user_id;
+        if ( $user_id <= 0 ) {
+            return;
+        }
+
+        if ( $this->is_importing_odoo_customer ) {
+            return;
+        }
+
+        if ( get_user_meta( $user_id, self::USER_META_CREATE_SENT, true ) ) {
+            return;
+        }
+
+        $lock_key = 'zarsam_odoo_create_customer_' . $user_id;
+        if ( get_transient( $lock_key ) ) {
+            return;
+        }
+
+        set_transient( $lock_key, 1, MINUTE_IN_SECONDS );
+
+        $this->api_key = get_option( 'odoo_token' );
+        $response      = $this->create_customer( $user_id );
+        $success       = !is_wp_error( $response );
+        $body          = $success ? json_decode( wp_remote_retrieve_body( $response ), true ) : [];
+
+        if ( $success && !empty( $body['error'] ) ) {
+            $success = false;
+        }
+
+        SyncLogger::log( [
+            'sync_type'     => 'customer_create_register',
+            'product_id'    => $user_id,
+            'sku'           => (string) $user_id,
+            'action'        => 'create_customer',
+            'request_data'  => [
+                'user_id' => $user_id,
+                'context' => current_action(),
+            ],
+            'response_data' => $success ? $body : [ 'error' => is_wp_error( $response ) ? $response->get_error_message() : ( $body['error'] ?? 'unknown' ) ],
+            'has_changes'   => $success ? 1 : 0,
+            'message'       => $success ? 'درخواست ساخت مشتری به Odoo ارسال شد' : 'ارسال مشتری جدید به Odoo ناموفق بود',
+            'is_error'      => !$success,
+        ] );
     }
 
     public function ajax_create_current_customer(): void
@@ -1357,6 +1421,10 @@ class OdooWooSync
 
         self::$add_to_cart_error_message = (string) ( $result['message'] ?? '' );
 
+        if ( function_exists( 'wc_clear_notices' ) ) {
+            wc_clear_notices( 'success' );
+        }
+
         if ( self::$add_to_cart_error_message !== '' && function_exists( 'wc_add_notice' ) ) {
             wc_add_notice( self::$add_to_cart_error_message, 'error' );
         }
@@ -1453,6 +1521,21 @@ class OdooWooSync
     }
 
     private function validate_product_stock_with_odoo( $product, int $quantity, string $sync_type ): array
+    {
+        $product_id = (int) $product->get_id();
+        $cache_key  = $product_id . '|' . $quantity . '|' . $sync_type;
+
+        if ( isset( self::$product_stock_validation_cache[ $cache_key ] ) ) {
+            return self::$product_stock_validation_cache[ $cache_key ];
+        }
+
+        $result = $this->query_product_stock_with_odoo( $product, $quantity, $sync_type );
+        self::$product_stock_validation_cache[ $cache_key ] = $result;
+
+        return $result;
+    }
+
+    private function query_product_stock_with_odoo( $product, int $quantity, string $sync_type ): array
     {
         $product_id = (int) $product->get_id();
         $sku        = (string) $product->get_sku();
@@ -2222,6 +2305,22 @@ class OdooWooSync
         SyncLogger::export_csv( $filters );
     }
 
+    public function delete_all_logs(): void
+    {
+        if ( !current_user_can( 'manage_options' ) ) {
+            wp_die( 'دسترسی ندارید' );
+        }
+
+        check_admin_referer( 'zarsam_odoo_delete_all_logs' );
+
+        SyncLogger::delete_all_logs();
+
+        wp_safe_redirect(
+            add_query_arg( 'logs_deleted', '1', admin_url( 'admin.php?page=zarsam-odoo-logs' ) )
+        );
+        exit;
+    }
+
     public function mark_notifications_read(): void
     {
         if ( ! current_user_can( 'manage_options' ) ) {
@@ -2297,14 +2396,29 @@ class OdooWooSync
         }
 
         $result     = SyncLogger::get_logs( $page, $per_page, $filters );
+        $total_logs = SyncLogger::count_logs();
         $export_url = wp_nonce_url(
             add_query_arg( array_merge( [ 'action' => 'zarsam_odoo_export_logs' ], $filters ), admin_url( 'admin-post.php' ) ),
             'zarsam_odoo_export_logs'
+        );
+        $delete_all_url = wp_nonce_url(
+            admin_url( 'admin-post.php?action=zarsam_odoo_delete_all_logs' ),
+            'zarsam_odoo_delete_all_logs'
         );
         $base_url   = add_query_arg( array_merge( [ 'page' => 'zarsam-odoo-logs' ], $filters ), admin_url( 'admin.php' ) );
         ?>
         <div class="wrap">
             <h1>لاگ همگام‌سازی Odoo</h1>
+
+            <?php if ( !empty( $_GET['logs_deleted'] ) ) : ?>
+                <div class="notice notice-success is-dismissible">
+                    <p>همه لاگ‌ها با موفقیت حذف شدند.</p>
+                </div>
+            <?php endif; ?>
+
+            <p>
+                تعداد کل رکوردها: <strong><?php echo number_format_i18n( $total_logs ); ?></strong>
+            </p>
 
             <form method="get" style="margin: 15px 0;">
                 <input type="hidden" name="page" value="zarsam-odoo-logs">
@@ -2330,6 +2444,9 @@ class OdooWooSync
                     </option>
                     <option value="customer_create_after_login" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_create_after_login' ); ?>>
                         ایجاد مشتری بعد از لاگین
+                    </option>
+                    <option value="customer_create_register" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_create_register' ); ?>>
+                        ایجاد مشتری هنگام ثبت‌نام
                     </option>
                     <option value="customer_wallet_login" <?php selected( $filters[ 'sync_type' ] ?? '', 'customer_wallet_login' ); ?>>
                         کیف پول بعد از ورود
@@ -2366,6 +2483,14 @@ class OdooWooSync
                 </label>
                 <button type="submit" class="button">فیلتر</button>
                 <a href="<?php echo esc_url( $export_url ); ?>" class="button button-primary">خروجی CSV</a>
+                <?php if ( $total_logs > 0 ) : ?>
+                    <a href="<?php echo esc_url( $delete_all_url ); ?>"
+                       class="button button-secondary"
+                       style="color:#b32d2e;border-color:#b32d2e;"
+                       onclick="return confirm('همه لاگ‌ها حذف شوند؟ این عمل قابل بازگشت نیست.');">
+                        حذف همه لاگ‌ها
+                    </a>
+                <?php endif; ?>
             </form>
 
             <table class="widefat striped">
@@ -3215,14 +3340,12 @@ class OdooWooSync
 
     public function create_customer( $user_id )
     {
-//        if ( $this->is_importing_odoo_customer ) {
-//            return;
-//        }
-
         $user = get_userdata( $user_id );
         if ( !$user ) {
             return null;
         }
+
+        $this->api_key = get_option( 'odoo_token' );
 
         $data = [
             "customer_id"                => $user_id,
