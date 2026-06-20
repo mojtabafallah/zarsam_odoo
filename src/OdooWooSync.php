@@ -25,6 +25,7 @@ class OdooWooSync
     const USER_META_CREATE_SENT = 'zarsam_odoo_customer_create_sent';
 
     private static $instance                   = null;
+    private static $add_to_cart_error_message = '';
     private        $is_importing_odoo_customer = false;
 
     public function __construct()
@@ -33,11 +34,16 @@ class OdooWooSync
         $this->api_key  = get_option( 'odoo_token' );
         add_action( 'admin_menu', [ $this, 'menu' ] );
         add_action( 'user_register', [ $this, 'create_customer' ] );
-        add_action( 'woocommerce_order_status_completed', [ $this, 'create_order' ] );
+        add_action( 'woocommerce_init', [ $this, 'register_order_sync_status_hooks' ] );
         add_action( 'woocommerce_payment_complete', [ $this, 'sync_order_customer_wallet_after_payment' ] );
         add_action( 'wp_login', [ $this, 'sync_customer_wallet_after_login' ], 10, 2 );
         add_action( 'woocommerce_before_checkout_form', [ $this, 'sync_current_customer_wallet_on_checkout' ] );
         add_action( 'woocommerce_after_checkout_validation', [ $this, 'validate_cart_with_odoo_before_checkout' ], 10, 2 );
+        add_filter( 'woocommerce_add_to_cart_validation', [ $this, 'validate_add_to_cart_with_odoo' ], 10, 5 );
+        add_filter( 'woocommerce_update_cart_validation', [ $this, 'validate_update_cart_with_odoo' ], 10, 4 );
+        add_action( 'woocommerce_init', [ $this, 'register_custom_add_to_cart_ajax' ] );
+        add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_add_to_cart_error_script' ] );
+        add_action( 'zarsam_odoo_report_issue', [ $this, 'report_issue_to_odoo' ] );
         add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_login_sync_script' ] );
         add_action( 'template_redirect', [ $this, 'maybe_sync_product_price_on_view' ], 5 );
         add_action( 'template_redirect', [ $this, 'maybe_create_current_customer_after_login' ], 20 );
@@ -75,6 +81,55 @@ class OdooWooSync
         return self::$instance;
     }
 
+    public static function get_available_order_statuses(): array
+    {
+        if ( !function_exists( 'wc_get_order_statuses' ) ) {
+            return [];
+        }
+
+        $statuses = [];
+        foreach ( wc_get_order_statuses() as $slug => $label ) {
+            $statuses[ str_replace( 'wc-', '', $slug ) ] = $label;
+        }
+
+        return $statuses;
+    }
+
+    public static function get_order_sync_statuses(): array
+    {
+        $statuses = get_option( 'odoo_order_sync_statuses', null );
+
+        if ( $statuses === null ) {
+            return [ 'processing', 'completed' ];
+        }
+
+        if ( !is_array( $statuses ) ) {
+            return [];
+        }
+
+        $available = array_keys( self::get_available_order_statuses() );
+
+        return array_values(
+            array_filter(
+                array_map( 'sanitize_key', $statuses ),
+                static function ( $status ) use ( $available ) {
+                    return in_array( $status, $available, true );
+                }
+            )
+        );
+    }
+
+    public function register_order_sync_status_hooks(): void
+    {
+        foreach ( self::get_order_sync_statuses() as $status ) {
+            add_action(
+                'woocommerce_order_status_' . $status,
+                [ $this, 'maybe_sync_order_to_odoo' ],
+                20
+            );
+        }
+    }
+
     public function enqueue_login_sync_script(): void
     {
         $script_path = dirname( __DIR__ ) . '/assets/js/odoo-login-sync.js';
@@ -91,6 +146,92 @@ class OdooWooSync
         wp_localize_script( 'zarsam-odoo-login-sync', 'zarsamOdooLoginSync', [
             'ajaxUrl' => admin_url( 'admin-ajax.php' ),
         ] );
+    }
+
+    public function enqueue_add_to_cart_error_script(): void
+    {
+        if ( !function_exists( 'WC' ) ) {
+            return;
+        }
+
+        $script_path = dirname( __DIR__ ) . '/assets/js/odoo-add-to-cart.js';
+        $script_url  = plugins_url( 'assets/js/odoo-add-to-cart.js', dirname( __DIR__ ) . '/zarsam_odoo.php' );
+
+        wp_enqueue_script(
+            'zarsam-odoo-add-to-cart',
+            $script_url,
+            [ 'jquery', 'wc-add-to-cart' ],
+            file_exists( $script_path ) ? (string) filemtime( $script_path ) : ZARSAM_ODOO_VERSION,
+            true
+        );
+    }
+
+    public function register_custom_add_to_cart_ajax(): void
+    {
+        remove_action( 'wc_ajax_add_to_cart', [ 'WC_AJAX', 'add_to_cart' ] );
+        remove_action( 'wp_ajax_woocommerce_add_to_cart', [ 'WC_AJAX', 'add_to_cart' ] );
+        remove_action( 'wp_ajax_nopriv_woocommerce_add_to_cart', [ 'WC_AJAX', 'add_to_cart' ] );
+
+        add_action( 'wc_ajax_add_to_cart', [ $this, 'ajax_add_to_cart' ] );
+        add_action( 'wp_ajax_woocommerce_add_to_cart', [ $this, 'ajax_add_to_cart' ] );
+        add_action( 'wp_ajax_nopriv_woocommerce_add_to_cart', [ $this, 'ajax_add_to_cart' ] );
+    }
+
+    public function ajax_add_to_cart(): void
+    {
+        ob_start();
+
+        if ( !isset( $_POST['product_id'] ) ) {
+            return;
+        }
+
+        $product_id        = apply_filters( 'woocommerce_add_to_cart_product_id', absint( $_POST['product_id'] ) );
+        $product           = wc_get_product( $product_id );
+        $quantity          = empty( $_POST['quantity'] ) ? 1 : wc_stock_amount( wp_unslash( $_POST['quantity'] ) );
+        $passed_validation = apply_filters( 'woocommerce_add_to_cart_validation', true, $product_id, $quantity );
+        $product_status    = get_post_status( $product_id );
+        $variation_id      = 0;
+        $variation         = [];
+
+        if ( $product && $product->is_type( 'variation' ) ) {
+            $variation_id = $product_id;
+            $product_id   = $product->get_parent_id();
+            $variation    = $product->get_variation_attributes();
+        }
+
+        if ( $passed_validation && false !== WC()->cart->add_to_cart( $product_id, $quantity, $variation_id, $variation ) && 'publish' === $product_status ) {
+            do_action( 'woocommerce_ajax_added_to_cart', $product_id );
+
+            if ( 'yes' === get_option( 'woocommerce_cart_redirect_after_add' ) ) {
+                wc_add_to_cart_message( [ $product_id => $quantity ], true );
+            }
+
+            \WC_AJAX::get_refreshed_fragments();
+        } else {
+            $error_message = self::$add_to_cart_error_message;
+
+            if ( $error_message === '' ) {
+                $notices = wc_get_notices( 'error' );
+                if ( !empty( $notices ) ) {
+                    $messages      = wp_list_pluck( $notices, 'notice' );
+                    $error_message = implode( ' ', array_map( 'wp_strip_all_tags', $messages ) );
+                }
+            }
+
+            self::$add_to_cart_error_message = '';
+
+            $data = [
+                'error'         => true,
+                'product_url'   => apply_filters( 'woocommerce_cart_redirect_after_error', get_permalink( $product_id ), $product_id ),
+                'error_message' => $error_message,
+            ];
+
+            if ( $error_message !== '' ) {
+                $data['product_url'] = false;
+            }
+
+            wp_send_json( $data );
+        }
     }
 
     public function ajax_create_current_customer(): void
@@ -1197,20 +1338,82 @@ class OdooWooSync
         $this->sync_customer_wallet_from_odoo_user( get_current_user_id(), 'customer_wallet_checkout' );
     }
 
+    public function validate_add_to_cart_with_odoo( $passed, $product_id, $quantity, $variation_id = 0, $variations = [] )
+    {
+        if ( !$passed ) {
+            return false;
+        }
+
+        $product = wc_get_product( $variation_id ?: $product_id );
+        if ( !$product || !method_exists( $product, 'get_sku' ) ) {
+            return $passed;
+        }
+
+        $result = $this->validate_product_stock_with_odoo( $product, (int) $quantity, 'add_to_cart' );
+        if ( !empty( $result['valid'] ) ) {
+            self::$add_to_cart_error_message = '';
+            return true;
+        }
+
+        self::$add_to_cart_error_message = (string) ( $result['message'] ?? '' );
+
+        if ( self::$add_to_cart_error_message !== '' && function_exists( 'wc_add_notice' ) ) {
+            wc_add_notice( self::$add_to_cart_error_message, 'error' );
+        }
+
+        if ( !empty( $result['out_of_stock'] ) ) {
+            $this->notify_failed_purchase_stock(
+                [],
+                $product,
+                (string) ( $result['sku'] ?? $product->get_sku() ),
+                (int) $quantity,
+                (int) ( $result['live_stock'] ?? 0 )
+            );
+        }
+
+        return false;
+    }
+
+    public function validate_update_cart_with_odoo( $passed, $cart_item_key, $values, $quantity )
+    {
+        if ( !$passed ) {
+            return false;
+        }
+
+        $product = $values['data'] ?? null;
+        if ( !$product || !method_exists( $product, 'get_sku' ) ) {
+            return $passed;
+        }
+
+        $result = $this->validate_product_stock_with_odoo( $product, (int) $quantity, 'cart_update' );
+        if ( !empty( $result['valid'] ) ) {
+            return true;
+        }
+
+        if ( !empty( $result['message'] ) && function_exists( 'wc_add_notice' ) ) {
+            wc_add_notice( $result['message'], 'error' );
+        }
+
+        if ( !empty( $result['out_of_stock'] ) ) {
+            $this->notify_failed_purchase_stock(
+                [],
+                $product,
+                (string) ( $result['sku'] ?? $product->get_sku() ),
+                (int) $quantity,
+                (int) ( $result['live_stock'] ?? 0 )
+            );
+        }
+
+        return false;
+    }
+
     public function validate_cart_with_odoo_before_checkout( array $data, \WP_Error $errors ): void
     {
         if ( !function_exists( 'WC' ) || !WC()->cart || WC()->cart->is_empty() ) {
             return;
         }
 
-        $rates = $this->get_zarsim_rates( 'checkout_validation' );
-        if ( $rates === false ) {
-            $errors->add(
-                'zarsam_rates_unavailable',
-                'در حال حاضر امکان بررسی قیمت لحظه‌ای وجود ندارد. لطفا چند دقیقه دیگر دوباره تلاش کنید.'
-            );
-            return;
-        }
+        $should_recalculate = false;
 
         foreach ( WC()->cart->get_cart() as $cart_item ) {
             $product = $cart_item[ 'data' ] ?? null;
@@ -1218,104 +1421,161 @@ class OdooWooSync
                 continue;
             }
 
-            $sku        = (string) $product->get_sku();
-            $product_id = (int) $product->get_id();
+            $cart_qty = (int) ( $cart_item[ 'quantity' ] ?? 0 );
+            $result   = $this->validate_product_stock_with_odoo( $product, $cart_qty, 'checkout_validation' );
 
-            if ( $sku === '' ) {
-                $errors->add(
-                    'zarsam_odoo_missing_sku',
-                    sprintf( 'محصول «%s» شناسه SKU ندارد و امکان بررسی با Odoo وجود ندارد.', $product->get_name() )
-                );
-                continue;
-            }
-
-            $request_payload = [ 'default_code' => $sku ];
-            $response        = $this->call_odoo( 'get_product_list', $request_payload );
-
-            if ( is_wp_error( $response ) ) {
-                SyncLogger::log( [
-                    'sync_type'       => 'checkout_validation',
-                    'product_id'      => $product_id,
-                    'sku'             => $sku,
-                    'action'          => 'zarsam_odoo_unavailable',
-                    'request_data'    => $request_payload,
-                    'response_data'   => [ 'error' => $response->get_error_message() ],
-                    'has_changes'     => 0,
-                    'message'         => 'خطا در اتصال به Odoo هنگام پرداخت',
-                    'is_error'        => true,
-                    'suppress_notify' => true,
-                ] );
-
-                $errors->add(
-                    'zarsam_odoo_unavailable',
-                    'در حال حاضر ارتباط با Odoo برقرار نیست و سفارش ثبت نمی‌شود. لطفا چند دقیقه دیگر دوباره تلاش کنید.'
-                );
-                continue;
-            }
-
-            $status_code = (int) wp_remote_retrieve_response_code( $response );
-            $body        = json_decode( wp_remote_retrieve_body( $response ), true );
-            $odoo_data   = $body[ 'result' ][ 0 ] ?? null;
-
-            if ( $status_code < 200 || $status_code >= 300 || !empty( $body[ 'error' ] ) || empty( $odoo_data ) || !is_array( $odoo_data ) ) {
-                SyncLogger::log( [
-                    'sync_type'     => 'checkout_validation',
-                    'product_id'    => $product_id,
-                    'sku'           => $sku,
-                    'action'        => 'zarsam_odoo_invalid_response',
-                    'request_data'  => $request_payload,
-                    'response_data' => $body ?: wp_remote_retrieve_body( $response ),
-                    'has_changes'   => 0,
-                    'message'       => 'پاسخ نامعتبر از Odoo هنگام پرداخت',
-                    'is_error'      => true,
-                ] );
-
-                $errors->add(
-                    'zarsam_odoo_invalid_response',
-                    sprintf( 'امکان بررسی لحظه‌ای محصول «%s» در Odoo وجود ندارد و سفارش ثبت نمی‌شود.', $product->get_name() )
-                );
-                continue;
-            }
-
-            $calculation   = $this->calculateProductPrice( $odoo_data, $rates );
-            $live_price    = (float) ( $calculation[ 'final_price' ] ?? 0 );
-            $woo_price     = (float) $product->get_price();
-            $live_stock    = (int) ( $odoo_data[ 'qty_available' ] ?? 0 );
-            $cart_qty      = (int) ( $cart_item[ 'quantity' ] ?? 0 );
-            $price_changed = abs( $live_price - $woo_price ) > 0.01;
-            $stock_changed = $live_stock !== (int) $product->get_stock_quantity();
-            $needs_sync    = $price_changed || $stock_changed;
-            $out_of_stock  = $live_stock <= 0 || $live_stock < $cart_qty;
-
-            if ( $needs_sync ) {
-                $this->zarsim_process_single_product( $odoo_data, $rates, 'checkout_validation', $product_id );
-            }
-
-            if ( $out_of_stock ) {
-                $this->notify_failed_purchase_stock( $data, $product, $sku, $cart_qty, $live_stock );
-
-                if ( $live_stock <= 0 ) {
-                    $errors->add(
-                        'zarsam_odoo_out_of_stock',
-                        sprintf( 'محصول «%s» موجود نیست و امکان خرید وجود ندارد.', $product->get_name() )
-                    );
-                } else {
-                    $errors->add(
-                        'zarsam_odoo_insufficient_stock',
-                        sprintf(
-                            'موجودی محصول «%s» کافی نیست. موجودی فعلی: %d',
-                            $product->get_name(),
-                            $live_stock
-                        )
-                    );
+            if ( !empty( $result['valid'] ) ) {
+                if ( !empty( $result['needs_recalculate'] ) ) {
+                    $should_recalculate = true;
                 }
                 continue;
             }
 
-            if ( $needs_sync && function_exists( 'WC' ) && WC()->cart ) {
-                WC()->cart->calculate_totals();
+            if ( !empty( $result['out_of_stock'] ) ) {
+                $this->notify_failed_purchase_stock(
+                    $data,
+                    $product,
+                    (string) ( $result['sku'] ?? $product->get_sku() ),
+                    $cart_qty,
+                    (int) ( $result['live_stock'] ?? 0 )
+                );
             }
+
+            $errors->add(
+                (string) ( $result['error_code'] ?? 'zarsam_odoo_validation_failed' ),
+                (string) ( $result['message'] ?? 'امکان ثبت سفارش وجود ندارد.' )
+            );
         }
+
+        if ( $should_recalculate && function_exists( 'WC' ) && WC()->cart ) {
+            WC()->cart->calculate_totals();
+        }
+    }
+
+    private function validate_product_stock_with_odoo( $product, int $quantity, string $sync_type ): array
+    {
+        $product_id = (int) $product->get_id();
+        $sku        = (string) $product->get_sku();
+
+        if ( $sku === '' ) {
+            return [
+                'valid'      => false,
+                'error_code' => 'zarsam_odoo_missing_sku',
+                'message'    => sprintf(
+                    'محصول «%s» شناسه SKU ندارد و امکان بررسی با Odoo وجود ندارد.',
+                    $product->get_name()
+                ),
+            ];
+        }
+
+        $rates = $this->get_zarsim_rates( $sync_type );
+        if ( $rates === false ) {
+            return [
+                'valid'      => false,
+                'error_code' => 'zarsam_rates_unavailable',
+                'message'    => $sync_type === 'checkout_validation'
+                    ? 'در حال حاضر امکان بررسی قیمت لحظه‌ای وجود ندارد. لطفا چند دقیقه دیگر دوباره تلاش کنید.'
+                    : 'در حال حاضر امکان بررسی موجودی وجود ندارد. لطفا چند دقیقه دیگر دوباره تلاش کنید.',
+            ];
+        }
+
+        $request_payload = [ 'default_code' => $sku ];
+        $response        = $this->call_odoo( 'get_product_list', $request_payload );
+
+        if ( is_wp_error( $response ) ) {
+            SyncLogger::log( [
+                'sync_type'       => $sync_type,
+                'product_id'      => $product_id,
+                'sku'             => $sku,
+                'action'          => 'zarsam_odoo_unavailable',
+                'request_data'    => $request_payload,
+                'response_data'   => [ 'error' => $response->get_error_message() ],
+                'has_changes'     => 0,
+                'message'         => 'خطا در اتصال به Odoo',
+                'is_error'        => true,
+                'suppress_notify' => $sync_type !== 'checkout_validation',
+            ] );
+
+            return [
+                'valid'      => false,
+                'error_code' => 'zarsam_odoo_unavailable',
+                'message'    => $sync_type === 'checkout_validation'
+                    ? 'در حال حاضر ارتباط با Odoo برقرار نیست و سفارش ثبت نمی‌شود. لطفا چند دقیقه دیگر دوباره تلاش کنید.'
+                    : 'در حال حاضر ارتباط با Odoo برقرار نیست. لطفا چند دقیقه دیگر دوباره تلاش کنید.',
+            ];
+        }
+
+        $status_code = (int) wp_remote_retrieve_response_code( $response );
+        $body        = json_decode( wp_remote_retrieve_body( $response ), true );
+        $odoo_data   = $body[ 'result' ][ 0 ] ?? null;
+
+        if ( $status_code < 200 || $status_code >= 300 || !empty( $body[ 'error' ] ) || empty( $odoo_data ) || !is_array( $odoo_data ) ) {
+            SyncLogger::log( [
+                'sync_type'     => $sync_type,
+                'product_id'    => $product_id,
+                'sku'           => $sku,
+                'action'        => 'zarsam_odoo_invalid_response',
+                'request_data'  => $request_payload,
+                'response_data' => $body ?: wp_remote_retrieve_body( $response ),
+                'has_changes'   => 0,
+                'message'       => 'پاسخ نامعتبر از Odoo',
+                'is_error'      => true,
+            ] );
+
+            return [
+                'valid'      => false,
+                'error_code' => 'zarsam_odoo_invalid_response',
+                'message'    => $sync_type === 'checkout_validation'
+                    ? sprintf( 'امکان بررسی لحظه‌ای محصول «%s» در Odoo وجود ندارد و سفارش ثبت نمی‌شود.', $product->get_name() )
+                    : sprintf( 'امکان بررسی محصول «%s» در Odoo وجود ندارد.', $product->get_name() ),
+            ];
+        }
+
+        $calculation   = $this->calculateProductPrice( $odoo_data, $rates );
+        $live_price    = (float) ( $calculation[ 'final_price' ] ?? 0 );
+        $woo_price     = (float) $product->get_price();
+        $live_stock    = (int) ( $odoo_data[ 'qty_available' ] ?? 0 );
+        $price_changed = abs( $live_price - $woo_price ) > 0.01;
+        $stock_changed = $live_stock !== (int) $product->get_stock_quantity();
+        $needs_sync    = $price_changed || $stock_changed;
+        $out_of_stock  = $live_stock <= 0 || $live_stock < $quantity;
+
+        if ( $needs_sync ) {
+            $this->zarsim_process_single_product( $odoo_data, $rates, $sync_type, $product_id );
+        }
+
+        if ( $out_of_stock ) {
+            if ( $live_stock <= 0 ) {
+                return [
+                    'valid'       => false,
+                    'out_of_stock'=> true,
+                    'sku'         => $sku,
+                    'live_stock'  => $live_stock,
+                    'error_code'  => 'zarsam_odoo_out_of_stock',
+                    'message'     => sprintf( 'محصول «%s» موجود نیست و امکان خرید وجود ندارد.', $product->get_name() ),
+                ];
+            }
+
+            return [
+                'valid'        => false,
+                'out_of_stock' => true,
+                'sku'          => $sku,
+                'live_stock'   => $live_stock,
+                'error_code'   => 'zarsam_odoo_insufficient_stock',
+                'message'      => sprintf(
+                    'موجودی محصول «%s» کافی نیست. موجودی فعلی: %d',
+                    $product->get_name(),
+                    $live_stock
+                ),
+            ];
+        }
+
+        return [
+            'valid'              => true,
+            'sku'                => $sku,
+            'live_stock'         => $live_stock,
+            'needs_recalculate'  => $needs_sync,
+        ];
     }
 
     private function notify_failed_purchase_stock( array $checkout_data, $product, string $sku, int $cart_qty, int $live_stock ): void
@@ -1682,6 +1942,7 @@ class OdooWooSync
     {
         $user       = get_userdata( $user_id );
         $candidates = [
+            get_user_meta( $user_id, 'mreeir_phone', true ),
             get_user_meta( $user_id, 'billing_phone', true ),
             get_user_meta( $user_id, 'digits_phone', true ),
             get_user_meta( $user_id, 'digits_phone_no', true ),
@@ -2222,6 +2483,19 @@ class OdooWooSync
                 'odoo_sync_price_on_product_view',
                 ! empty( $_POST['sync_price_on_product_view'] ) ? 'yes' : 'no'
             );
+
+            $selected_statuses = [];
+            if ( isset( $_POST['odoo_order_sync_statuses'] ) && is_array( $_POST['odoo_order_sync_statuses'] ) ) {
+                $available_statuses = array_keys( self::get_available_order_statuses() );
+                foreach ( $_POST['odoo_order_sync_statuses'] as $status ) {
+                    $status = sanitize_key( wp_unslash( $status ) );
+                    if ( in_array( $status, $available_statuses, true ) ) {
+                        $selected_statuses[] = $status;
+                    }
+                }
+            }
+
+            update_option( 'odoo_order_sync_statuses', $selected_statuses );
         }
 
         $base_url = get_option( 'odoo_base_url' );
@@ -2229,6 +2503,8 @@ class OdooWooSync
         $token    = get_option( 'odoo_token' );
         $error_notification_emails = get_option( 'odoo_error_notification_emails', '' );
         $sync_price_on_product_view = get_option( 'odoo_sync_price_on_product_view', 'no' );
+        $order_sync_statuses = self::get_order_sync_statuses();
+        $available_order_statuses = self::get_available_order_statuses();
         $admin_notifications = SyncLogger::get_admin_notifications( 10 );
         $unread_notifications = SyncLogger::get_unread_notification_count();
         $mark_notifications_read_url = wp_nonce_url(
@@ -2299,6 +2575,29 @@ class OdooWooSync
                                     هنگام ورود کاربر به صفحه محصول، قیمت و موجودی از Odoo بروزرسانی شود
                                 </label>
                                 <p class="description">به‌صورت پیش‌فرض غیرفعال است. برای جلوگیری از درخواست‌های زیاد، هر محصول حداکثر هر ۲ دقیقه یک‌بار بروزرسانی می‌شود.</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row">وضعیت‌های ارسال سفارش به Odoo</th>
+                            <td>
+                                <?php if ( empty( $available_order_statuses ) ) : ?>
+                                    <p class="description">WooCommerce فعال نیست یا وضعیت سفارشی یافت نشد.</p>
+                                <?php else : ?>
+                                    <fieldset class="zarsam-odoo-order-statuses">
+                                        <legend class="screen-reader-text">وضعیت‌های ارسال سفارش به Odoo</legend>
+                                        <?php foreach ( $available_order_statuses as $status_slug => $status_label ) : ?>
+                                            <label style="display:block;margin-bottom:6px;">
+                                                <input type="checkbox"
+                                                       name="odoo_order_sync_statuses[]"
+                                                       value="<?php echo esc_attr( $status_slug ); ?>"
+                                                    <?php checked( in_array( $status_slug, $order_sync_statuses, true ) ); ?>>
+                                                <?php echo esc_html( $status_label ); ?>
+                                                <code><?php echo esc_html( $status_slug ); ?></code>
+                                            </label>
+                                        <?php endforeach; ?>
+                                    </fieldset>
+                                    <p class="description">بعد از تغییر وضعیت سفارش به هر مورد انتخاب‌شده، سفارش به‌صورت خودکار به Odoo ارسال می‌شود. اگر هیچ وضعیتی انتخاب نشود، فقط ارسال دستی از پنل سفارش انجام می‌شود.</p>
+                                <?php endif; ?>
                             </td>
                         </tr>
                         </tbody>
@@ -2569,7 +2868,11 @@ class OdooWooSync
 
     private function call_odoo( $method, $data )
     {
+        return $this->call_odoo_model( 'res.partner.api', $method, $data );
+    }
 
+    private function call_odoo_model( string $model, string $method, $data, bool $notify_on_error = true )
+    {
         $base = get_option( 'odoo_base_url' );
         $db   = get_option( 'odoo_db' );
         $args = $data === null ? [] : [ $data ];
@@ -2584,7 +2887,7 @@ class OdooWooSync
                     $db,
                     $this->uid,
                     $this->api_key,
-                    "res.partner.api",
+                    $model,
                     $method,
                     $args
                 ]
@@ -2605,26 +2908,28 @@ class OdooWooSync
 
         $sku = '';
         if ( is_array( $data ) ) {
-            $sku = (string) ( $data['default_code'] ?? $data['id'] ?? $data['woo_order_id'] ?? $data['customer_id'] ?? '' );
+            $sku = (string) ( $data['name'] ?? $data['default_code'] ?? $data['id'] ?? $data['woo_order_id'] ?? $data['customer_id'] ?? '' );
         }
 
         if ( is_wp_error( $result ) ) {
-            SyncLogger::notify_error( [
-                'sync_type'     => 'odoo_api',
-                'sku'           => $sku ?: null,
-                'action'        => (string) $method,
-                'request_data'  => $data,
-                'response_data' => [ 'error' => $result->get_error_message() ],
-                'message'       => 'خطا در اتصال به Odoo: ' . $result->get_error_message(),
-                'is_error'      => true,
-            ] );
+            if ( $notify_on_error ) {
+                SyncLogger::notify_error( [
+                    'sync_type'     => 'odoo_api',
+                    'sku'           => $sku ?: null,
+                    'action'        => (string) $method,
+                    'request_data'  => $data,
+                    'response_data' => [ 'error' => $result->get_error_message() ],
+                    'message'       => 'خطا در اتصال به Odoo: ' . $result->get_error_message(),
+                    'is_error'      => true,
+                ] );
+            }
             return $result;
         }
 
         $status_code = (int) wp_remote_retrieve_response_code( $result );
         $decoded     = json_decode( wp_remote_retrieve_body( $result ), true );
 
-        if ( $status_code < 200 || $status_code >= 300 || ! empty( $decoded['error'] ) ) {
+        if ( $notify_on_error && ( $status_code < 200 || $status_code >= 300 || ! empty( $decoded['error'] ) ) ) {
             SyncLogger::notify_error( [
                 'sync_type'     => 'odoo_api',
                 'sku'           => $sku ?: null,
@@ -2637,6 +2942,34 @@ class OdooWooSync
         }
 
         return $result;
+    }
+
+    public function report_issue_to_odoo( array $args ): void
+    {
+        $name = trim( (string) ( $args['message'] ?? '' ) );
+        if ( $name === '' ) {
+            $sync_type = trim( (string) ( $args['sync_type'] ?? '' ) );
+            $action    = trim( (string) ( $args['action'] ?? 'خطا' ) );
+            $name      = trim( $sync_type . ' - ' . $action, ' -' );
+        }
+
+        if ( $name === '' ) {
+            $name = 'خطای Odoo';
+        }
+
+        $dedup_key = 'zarsam_odoo_issue_' . md5( $name );
+        if ( get_transient( $dedup_key ) ) {
+            return;
+        }
+
+        set_transient( $dedup_key, 1, 2 * MINUTE_IN_SECONDS );
+
+        $this->call_odoo_model(
+            'zarsim.issues',
+            'get_issues',
+            [ 'name' => $name ],
+            false
+        );
     }
 
     private function add_odoo_order_note( $order, string $method, $response ): void
@@ -2911,9 +3244,23 @@ class OdooWooSync
         return $response;
     }
 
+    public function maybe_sync_order_to_odoo( int $order_id ): void
+    {
+        $order = wc_get_order( $order_id );
+        if ( !$order ) {
+            return;
+        }
+
+        if ( $order->get_meta( 'zarsam_odoo_order_last_status' ) === 'success' ) {
+            return;
+        }
+
+        $this->sync_order_to_odoo( $order_id );
+    }
+
     public function create_order( $order_id )
     {
-        $this->sync_order_to_odoo( (int) $order_id );
+        $this->maybe_sync_order_to_odoo( (int) $order_id );
     }
 
 }

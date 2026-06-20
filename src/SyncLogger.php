@@ -220,6 +220,7 @@ class SyncLogger
     {
         self::notify_error_emails( $args );
         self::add_admin_notification( $args );
+        do_action( 'zarsam_odoo_report_issue', $args );
     }
 
     public static function notify_error_emails( array $args ): void
