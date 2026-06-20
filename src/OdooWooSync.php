@@ -155,20 +155,72 @@ class OdooWooSync
 
     public function enqueue_add_to_cart_error_script(): void
     {
-        if ( !function_exists( 'WC' ) ) {
+        if ( !function_exists( 'is_woocommerce' ) || !is_woocommerce() ) {
             return;
         }
 
         $script_path = dirname( __DIR__ ) . '/assets/js/odoo-add-to-cart.js';
         $script_url  = plugins_url( 'assets/js/odoo-add-to-cart.js', dirname( __DIR__ ) . '/zarsam_odoo.php' );
+        $deps        = [ 'jquery' ];
+
+        if ( wp_script_is( 'wc-add-to-cart', 'registered' ) ) {
+            $deps[] = 'wc-add-to-cart';
+        }
 
         wp_enqueue_script(
             'zarsam-odoo-add-to-cart',
             $script_url,
-            [ 'jquery', 'wc-add-to-cart' ],
+            $deps,
             file_exists( $script_path ) ? (string) filemtime( $script_path ) : ZARSAM_ODOO_VERSION,
             true
         );
+
+        wp_localize_script(
+            'zarsam-odoo-add-to-cart',
+            'zarsamOdooAddToCart',
+            [
+                'errorMessage'          => $this->get_add_to_cart_error_message_for_display(),
+                'defaultErrorMessage'   => 'امکان افزودن این محصول به سبد خرید وجود ندارد.',
+            ]
+        );
+
+        wp_register_style( 'zarsam-odoo-add-to-cart', false, [], ZARSAM_ODOO_VERSION );
+        wp_enqueue_style( 'zarsam-odoo-add-to-cart' );
+        wp_add_inline_style(
+            'zarsam-odoo-add-to-cart',
+            '#custom-addtocart-toast.zarsam-odoo-cart-error .toast-inner,' .
+            '.custom-addtocart-toast.zarsam-odoo-cart-error .toast-inner{background:#b32d2e!important;color:#fff!important}' .
+            '#custom-addtocart-toast.zarsam-odoo-cart-error .toast-text,' .
+            '.custom-addtocart-toast.zarsam-odoo-cart-error .toast-text{color:#fff!important}'
+        );
+    }
+
+    private function get_add_to_cart_error_message_for_display(): string
+    {
+        if ( self::$add_to_cart_error_message !== '' ) {
+            return self::$add_to_cart_error_message;
+        }
+
+        if ( function_exists( 'WC' ) && WC()->session ) {
+            $session_error = WC()->session->get( 'zarsam_odoo_show_cart_error' );
+            if ( $session_error ) {
+                WC()->session->__unset( 'zarsam_odoo_show_cart_error' );
+                return wp_strip_all_tags( (string) $session_error );
+            }
+        }
+
+        if ( !function_exists( 'wc_get_notices' ) ) {
+            return '';
+        }
+
+        foreach ( wc_get_notices( 'error' ) as $notice ) {
+            $message = wp_strip_all_tags( (string) ( $notice['notice'] ?? '' ) );
+            if ( $message !== '' ) {
+                return $message;
+            }
+        }
+
+        return '';
     }
 
     public function register_custom_add_to_cart_ajax(): void
@@ -1416,6 +1468,9 @@ class OdooWooSync
         $result = $this->validate_product_stock_with_odoo( $product, (int) $quantity, 'add_to_cart' );
         if ( !empty( $result['valid'] ) ) {
             self::$add_to_cart_error_message = '';
+            if ( function_exists( 'WC' ) && WC()->session ) {
+                WC()->session->__unset( 'zarsam_odoo_show_cart_error' );
+            }
             return true;
         }
 
@@ -1427,6 +1482,10 @@ class OdooWooSync
 
         if ( self::$add_to_cart_error_message !== '' && function_exists( 'wc_add_notice' ) ) {
             wc_add_notice( self::$add_to_cart_error_message, 'error' );
+        }
+
+        if ( function_exists( 'WC' ) && WC()->session ) {
+            WC()->session->set( 'zarsam_odoo_show_cart_error', self::$add_to_cart_error_message );
         }
 
         if ( !empty( $result['out_of_stock'] ) ) {
