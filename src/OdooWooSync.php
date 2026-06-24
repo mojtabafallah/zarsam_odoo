@@ -25,7 +25,6 @@ class OdooWooSync
     const USER_META_CREATE_SENT = 'zarsam_odoo_customer_create_sent';
 
     private static $instance                        = null;
-    private static $add_to_cart_error_message       = '';
     private static $product_stock_validation_cache  = [];
     private        $is_importing_odoo_customer      = false;
 
@@ -42,13 +41,12 @@ class OdooWooSync
         add_action( 'wp_login', [ $this, 'sync_customer_wallet_after_login' ], 10, 2 );
         add_action( 'woocommerce_before_checkout_form', [ $this, 'sync_current_customer_wallet_on_checkout' ] );
         add_action( 'woocommerce_after_checkout_validation', [ $this, 'validate_cart_with_odoo_before_checkout' ], 10, 2 );
-        add_filter( 'woocommerce_add_to_cart_validation', [ $this, 'validate_add_to_cart_with_odoo' ], 10, 5 );
         add_filter( 'woocommerce_update_cart_validation', [ $this, 'validate_update_cart_with_odoo' ], 10, 4 );
-        add_filter( 'woocommerce_add_to_cart_redirect', [ $this, 'maybe_block_add_to_cart_redirect' ], 10, 2 );
-        add_action( 'woocommerce_init', [ $this, 'register_custom_add_to_cart_ajax' ] );
-        add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_add_to_cart_error_script' ] );
         add_action( 'zarsam_odoo_report_issue', [ $this, 'report_issue_to_odoo' ] );
         add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_login_sync_script' ] );
+        add_action( 'wp_enqueue_scripts', [ $this, 'enqueue_product_sync_button_script' ] );
+        add_action( 'woocommerce_after_add_to_cart_button', [ $this, 'render_frontend_product_sync_button' ] );
+        add_action( 'wp_ajax_zarsam_odoo_sync_product_frontend', [ $this, 'ajax_sync_product_frontend' ] );
         add_action( 'template_redirect', [ $this, 'maybe_sync_product_price_on_view' ], 5 );
         add_action( 'template_redirect', [ $this, 'maybe_create_current_customer_after_login' ], 20 );
 
@@ -153,154 +151,107 @@ class OdooWooSync
         ] );
     }
 
-    public function enqueue_add_to_cart_error_script(): void
+    public function enqueue_product_sync_button_script(): void
     {
-        if ( !function_exists( 'is_woocommerce' ) || !is_woocommerce() ) {
+        if ( ! function_exists( 'is_product' ) || ! is_product() || ! current_user_can( 'manage_options' ) ) {
             return;
         }
 
-        $script_path = dirname( __DIR__ ) . '/assets/js/odoo-add-to-cart.js';
-        $script_url  = plugins_url( 'assets/js/odoo-add-to-cart.js', dirname( __DIR__ ) . '/zarsam_odoo.php' );
-        $deps        = [ 'jquery' ];
-
-        if ( wp_script_is( 'wc-add-to-cart', 'registered' ) ) {
-            $deps[] = 'wc-add-to-cart';
+        $product_id = (int) get_queried_object_id();
+        if ( ! $product_id ) {
+            return;
         }
 
+        $script_path = dirname( __DIR__ ) . '/assets/js/odoo-product-sync-button.js';
+        $script_url  = plugins_url( 'assets/js/odoo-product-sync-button.js', dirname( __DIR__ ) . '/zarsam_odoo.php' );
+
         wp_enqueue_script(
-            'zarsam-odoo-add-to-cart',
+            'zarsam-odoo-product-sync-button',
             $script_url,
-            $deps,
+            [ 'jquery' ],
             file_exists( $script_path ) ? (string) filemtime( $script_path ) : ZARSAM_ODOO_VERSION,
             true
         );
 
         wp_localize_script(
-            'zarsam-odoo-add-to-cart',
-            'zarsamOdooAddToCart',
+            'zarsam-odoo-product-sync-button',
+            'zarsamOdooProductSync',
             [
-                'errorMessage'          => $this->get_add_to_cart_error_message_for_display(),
-                'defaultErrorMessage'   => 'امکان افزودن این محصول به سبد خرید وجود ندارد.',
+                'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
+                'nonce'       => wp_create_nonce( 'zarsam_odoo_frontend_sync' ),
+                'productId'   => $product_id,
+                'loadingText' => 'در حال بروزرسانی از Odoo...',
+                'successText' => 'محصول بروزرسانی شد. در حال بارگذاری مجدد...',
+                'errorText'   => 'خطا در بروزرسانی محصول',
+                'failText'    => 'خطا در ارتباط با سرور',
             ]
         );
 
-        wp_register_style( 'zarsam-odoo-add-to-cart', false, [], ZARSAM_ODOO_VERSION );
-        wp_enqueue_style( 'zarsam-odoo-add-to-cart' );
+        wp_register_style( 'zarsam-odoo-product-sync-button', false, [], ZARSAM_ODOO_VERSION );
+        wp_enqueue_style( 'zarsam-odoo-product-sync-button' );
         wp_add_inline_style(
-            'zarsam-odoo-add-to-cart',
-            '#custom-addtocart-toast.zarsam-odoo-cart-error .toast-inner,' .
-            '.custom-addtocart-toast.zarsam-odoo-cart-error .toast-inner{background:#b32d2e!important;color:#fff!important}' .
-            '#custom-addtocart-toast.zarsam-odoo-cart-error .toast-text,' .
-            '.custom-addtocart-toast.zarsam-odoo-cart-error .toast-text{color:#fff!important}'
+            'zarsam-odoo-product-sync-button',
+            '.zarsam-odoo-frontend-sync-wrap{margin:12px 0 0;padding:12px 14px;border:1px dashed #2271b1;border-radius:6px;background:#f0f6fc;clear:both}' .
+            '.zarsam-odoo-frontend-sync-wrap p{margin:0 0 8px;font-size:13px;color:#1d2327}' .
+            '#zarsam-odoo-frontend-sync.button{padding:8px 16px;font-size:13px;line-height:1.4}' .
+            '#zarsam-odoo-frontend-sync-status{margin:8px 0 0;font-size:13px}'
         );
     }
 
-    private function get_add_to_cart_error_message_for_display(): string
+    public function render_frontend_product_sync_button(): void
     {
-        if ( self::$add_to_cart_error_message !== '' ) {
-            return self::$add_to_cart_error_message;
-        }
-
-        if ( function_exists( 'WC' ) && WC()->session ) {
-            $session_error = WC()->session->get( 'zarsam_odoo_show_cart_error' );
-            if ( $session_error ) {
-                WC()->session->__unset( 'zarsam_odoo_show_cart_error' );
-                return wp_strip_all_tags( (string) $session_error );
-            }
-        }
-
-        if ( !function_exists( 'wc_get_notices' ) ) {
-            return '';
-        }
-
-        foreach ( wc_get_notices( 'error' ) as $notice ) {
-            $message = wp_strip_all_tags( (string) ( $notice['notice'] ?? '' ) );
-            if ( $message !== '' ) {
-                return $message;
-            }
-        }
-
-        return '';
-    }
-
-    public function register_custom_add_to_cart_ajax(): void
-    {
-        remove_action( 'wc_ajax_add_to_cart', [ 'WC_AJAX', 'add_to_cart' ] );
-        remove_action( 'wp_ajax_woocommerce_add_to_cart', [ 'WC_AJAX', 'add_to_cart' ] );
-        remove_action( 'wp_ajax_nopriv_woocommerce_add_to_cart', [ 'WC_AJAX', 'add_to_cart' ] );
-
-        add_action( 'wc_ajax_add_to_cart', [ $this, 'ajax_add_to_cart' ] );
-        add_action( 'wp_ajax_woocommerce_add_to_cart', [ $this, 'ajax_add_to_cart' ] );
-        add_action( 'wp_ajax_nopriv_woocommerce_add_to_cart', [ $this, 'ajax_add_to_cart' ] );
-    }
-
-    public function ajax_add_to_cart(): void
-    {
-        ob_start();
-
-        if ( !isset( $_POST['product_id'] ) ) {
+        if ( ! function_exists( 'is_product' ) || ! is_product() || ! current_user_can( 'manage_options' ) ) {
             return;
         }
 
-        self::$add_to_cart_error_message = '';
-
-        $product_id     = apply_filters( 'woocommerce_add_to_cart_product_id', absint( $_POST['product_id'] ) );
-        $product        = wc_get_product( $product_id );
-        $quantity       = empty( $_POST['quantity'] ) ? 1 : wc_stock_amount( wp_unslash( $_POST['quantity'] ) );
-        $product_status = get_post_status( $product_id );
-        $variation_id   = 0;
-        $variation      = [];
-
-        if ( $product && $product->is_type( 'variation' ) ) {
-            $variation_id = $product_id;
-            $product_id   = $product->get_parent_id();
-            $variation    = $product->get_variation_attributes();
+        $product_id = (int) get_the_ID();
+        if ( ! $product_id ) {
+            return;
         }
 
-        $added = WC()->cart->add_to_cart( $product_id, $quantity, $variation_id, $variation );
-
-        if ( false !== $added && 'publish' === $product_status ) {
-            do_action( 'woocommerce_ajax_added_to_cart', $product_id );
-
-            if ( 'yes' === get_option( 'woocommerce_cart_redirect_after_add' ) ) {
-                wc_add_to_cart_message( [ $product_id => $quantity ], true );
-            }
-
-            \WC_AJAX::get_refreshed_fragments();
-        }
-
-        wc_clear_notices( 'success' );
-
-        $error_message = self::$add_to_cart_error_message;
-
-        if ( $error_message === '' ) {
-            $notices = wc_get_notices( 'error' );
-            if ( !empty( $notices ) ) {
-                $messages      = wp_list_pluck( $notices, 'notice' );
-                $error_message = implode( ' ', array_map( 'wp_strip_all_tags', $messages ) );
-            }
-        }
-
-        if ( $error_message === '' ) {
-            $error_message = 'امکان افزودن این محصول به سبد خرید وجود ندارد.';
-        }
-
-        self::$add_to_cart_error_message = '';
-
-        wp_send_json( [
-            'error'         => true,
-            'product_url'   => false,
-            'error_message' => $error_message,
-        ] );
+        $last_sync = get_post_meta( $product_id, self::META_LAST_SYNC, true );
+        ?>
+        <div class="zarsam-odoo-frontend-sync-wrap">
+            <p>
+                <strong>همگام‌سازی Odoo (فقط ادمین)</strong>
+                <?php if ( $last_sync ) : ?>
+                    — آخرین بروزرسانی: <?php echo esc_html( $last_sync ); ?>
+                <?php endif; ?>
+            </p>
+            <button type="button" class="button alt" id="zarsam-odoo-frontend-sync">
+                بروزرسانی محصول از Odoo
+            </button>
+            <p id="zarsam-odoo-frontend-sync-status"></p>
+        </div>
+        <?php
     }
 
-    public function maybe_block_add_to_cart_redirect( $url, $product_id )
+    public function ajax_sync_product_frontend(): void
     {
-        if ( self::$add_to_cart_error_message !== '' || wc_notice_count( 'error' ) > 0 ) {
-            return false;
+        check_ajax_referer( 'zarsam_odoo_frontend_sync', 'nonce' );
+
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( [ 'message' => 'دسترسی ندارید' ] );
         }
 
-        return $url;
+        $product_id = isset( $_POST['product_id'] ) ? (int) $_POST['product_id'] : 0;
+        if ( ! $product_id || get_post_type( $product_id ) !== 'product' ) {
+            wp_send_json_error( [ 'message' => 'محصول نامعتبر است' ] );
+        }
+
+        $result = $this->sync_single_product_from_odoo( $product_id, 'frontend_admin_sync' );
+
+        if ( empty( $result['success'] ) ) {
+            wp_send_json_error( [
+                'message' => (string) ( $result['message'] ?? 'خطا در بروزرسانی محصول' ),
+            ] );
+        }
+
+        wp_send_json_success( [
+            'message'     => (string) ( $result['message'] ?? 'محصول بروزرسانی شد' ),
+            'has_changes' => ! empty( $result['has_changes'] ),
+            'final_price' => $result['final_price'] ?? 0,
+        ] );
     }
 
     public function create_customer_on_register( $user_id ): void
@@ -1452,53 +1403,6 @@ class OdooWooSync
         }
 
         $this->sync_customer_wallet_from_odoo_user( get_current_user_id(), 'customer_wallet_checkout' );
-    }
-
-    public function validate_add_to_cart_with_odoo( $passed, $product_id, $quantity, $variation_id = 0, $variations = [] )
-    {
-        if ( !$passed ) {
-            return false;
-        }
-
-        $product = wc_get_product( $variation_id ?: $product_id );
-        if ( !$product || !method_exists( $product, 'get_sku' ) ) {
-            return $passed;
-        }
-
-        $result = $this->validate_product_stock_with_odoo( $product, (int) $quantity, 'add_to_cart' );
-        if ( !empty( $result['valid'] ) ) {
-            self::$add_to_cart_error_message = '';
-            if ( function_exists( 'WC' ) && WC()->session ) {
-                WC()->session->__unset( 'zarsam_odoo_show_cart_error' );
-            }
-            return true;
-        }
-
-        self::$add_to_cart_error_message = (string) ( $result['message'] ?? '' );
-
-        if ( function_exists( 'wc_clear_notices' ) ) {
-            wc_clear_notices( 'success' );
-        }
-
-        if ( self::$add_to_cart_error_message !== '' && function_exists( 'wc_add_notice' ) ) {
-            wc_add_notice( self::$add_to_cart_error_message, 'error' );
-        }
-
-        if ( function_exists( 'WC' ) && WC()->session ) {
-            WC()->session->set( 'zarsam_odoo_show_cart_error', self::$add_to_cart_error_message );
-        }
-
-        if ( !empty( $result['out_of_stock'] ) ) {
-            $this->notify_failed_purchase_stock(
-                [],
-                $product,
-                (string) ( $result['sku'] ?? $product->get_sku() ),
-                (int) $quantity,
-                (int) ( $result['live_stock'] ?? 0 )
-            );
-        }
-
-        return false;
     }
 
     public function validate_update_cart_with_odoo( $passed, $cart_item_key, $values, $quantity )
