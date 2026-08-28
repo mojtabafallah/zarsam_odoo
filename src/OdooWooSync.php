@@ -3258,8 +3258,11 @@ class OdooWooSync
             "customer_mobile"            => $phone,
             "customer_birthdate"         => "1990-12-12",
             "customer_partner_birthdate" => "1990-12-12",
-            "customer_wedding_date"      => "1990-12-12"
-        ];
+            "customer_wedding_date"      => "1990-12-12",
+            'order_status' => $order->get_status(),
+            'payment_method_title' => $order->get_payment_method_title(),
+            'payment_method_id' => $order->get_payment_method()
+             ];
     }
 
     private function sync_order_to_odoo( int $order_id, bool $manual = false ): array
